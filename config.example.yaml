@@ -1,0 +1,74 @@
+# Copy this file to config.yaml and adjust to your environment.
+# config.yaml is gitignored.
+
+# The folder to scan. Use forward slashes or escaped backslashes.
+# Example (Windows): "C:/Users/me/Documents/MyDocs"
+target_folder: ""
+
+# Where the registry Excel file will be written (defaults to <target_folder>/registry.xlsx if empty).
+registry_xlsx: ""
+
+# LM Studio OpenAI-compatible server.
+llm:
+  base_url: "http://localhost:1234/v1"
+  api_key: "lm-studio"          # LM Studio ignores the value but the field is required.
+  model: "qwen/qwen3.5-9b"      # Must match the model identifier loaded in LM Studio.
+  request_timeout_seconds: 600
+  # Sampling
+  temperature: 0.1
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  # Thinking-mode behavior
+  thinking_default: false       # Fast first pass.
+  thinking_on_low_quality: true # Re-run with thinking ON if quality_score < threshold.
+  low_quality_threshold: 0.6
+  # Output token cap (per LLM call)
+  max_output_tokens: 2048
+
+# Text-extraction limits sent to the LLM (characters, not tokens).
+# Strategy: head + middle + tail of the document concatenated.
+extract:
+  head_chars: 12000
+  middle_chars: 4000
+  tail_chars: 4000
+  # Skip files larger than this many bytes (0 = no limit).
+  max_file_size_bytes: 0
+
+# Which extensions to consider documents.
+include_extensions:
+  - .pdf
+  - .docx
+  - .pptx
+  - .xlsx
+  - .doc
+  - .ppt
+  - .xls
+  - .txt
+  - .md
+  - .rtf
+  - .png
+  - .jpg
+  - .jpeg
+  - .gif
+  - .bmp
+  - .tif
+  - .tiff
+
+# Folders to ignore (case-insensitive, glob-like).
+ignore_dir_names:
+  - ".git"
+  - ".venv"
+  - "node_modules"
+  - "$RECYCLE.BIN"
+  - "System Volume Information"
+  - "__MACOSX"
+  - ".obsidian"
+
+# Excel write cadence: regenerate registry.xlsx every N completed files (and at end).
+excel_write_every_n_files: 10
+
+# Web app
+server:
+  host: "127.0.0.1"
+  port: 8000

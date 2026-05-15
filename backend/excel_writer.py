@@ -1,0 +1,165 @@
+"""Atomically (re)generate registry.xlsx from the SQLite store.
+
+Strategy:
+  - Build the workbook in memory using openpyxl.
+  - Write to <target>.tmp first, then os.replace() to <target>.
+  - If <target> is currently open in Excel.exe and the rename fails, log and
+    keep the .tmp file so user can rename it manually.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+from .schemas import FileRecord
+
+log = logging.getLogger("docregistrar.excel")
+
+SHEET_NAME = "Documents"
+
+COLUMNS: list[tuple[str, int]] = [
+    ("File name", 30),
+    ("Relative path", 50),
+    ("File size (bytes)", 14),
+    ("SHA-256", 36),
+    ("Extension", 10),
+    ("Page / slide count", 10),
+    ("OS created", 20),
+    ("OS modified", 20),
+    ("Title", 40),
+    ("Summary", 80),
+    ("Document date", 14),
+    ("Last update date", 14),
+    ("Document type", 18),
+    ("Language", 12),
+    ("Authors", 30),
+    ("Version", 10),
+    ("Confidentiality", 18),
+    ("Persons", 30),
+    ("Organizations", 30),
+    ("Locations", 25),
+    ("Mentioned dates", 25),
+    ("Products / technologies", 35),
+    ("Key concepts", 35),
+    ("Key phrases (top 10)", 50),
+    ("Tags", 30),
+    ("Geographic scope", 18),
+    ("Industry domain", 20),
+    ("Quality score", 10),
+    ("Used thinking", 10),
+    ("Status", 12),
+    ("Error", 30),
+    ("Indexed at", 20),
+]
+
+
+def _join(items: list[str] | None) -> str:
+    if not items:
+        return ""
+    return "; ".join(s for s in items if s)
+
+
+def _record_to_row(rec: FileRecord) -> list:
+    e = rec.extraction
+    return [
+        rec.file_name,
+        rec.relative_path,
+        rec.file_size,
+        rec.sha256,
+        rec.extension,
+        rec.page_count if rec.page_count is not None else "",
+        rec.os_created or "",
+        rec.os_modified or "",
+        (e.title if e else ""),
+        (e.summary if e else ""),
+        (e.document_date if e else ""),
+        (e.last_update_date if e else ""),
+        (e.document_type if e else ""),
+        (e.language if e else ""),
+        _join(e.authors) if e else "",
+        (e.version if e else ""),
+        (e.confidentiality if e else ""),
+        _join(e.named_entities.persons) if e else "",
+        _join(e.named_entities.organizations) if e else "",
+        _join(e.named_entities.locations) if e else "",
+        _join(e.named_entities.dates) if e else "",
+        _join(e.named_entities.products_technologies) if e else "",
+        _join(e.key_concepts) if e else "",
+        _join(e.key_phrases) if e else "",
+        _join(e.tags) if e else "",
+        (e.geographic_scope if e else ""),
+        (e.industry_domain if e else ""),
+        (round(e.quality_score, 3) if e else ""),
+        ("Yes" if rec.used_thinking else ""),
+        rec.status,
+        rec.error or "",
+        rec.indexed_at or "",
+    ]
+
+
+def write_registry(records: list[FileRecord], xlsx_path: Path) -> bool:
+    """Write/overwrite registry.xlsx atomically. Returns True on success."""
+    xlsx_path = Path(xlsx_path)
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        ws = wb.create_sheet(SHEET_NAME)
+    ws.title = SHEET_NAME
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFFFF")
+    header_align = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+    headers = [c[0] for c in COLUMNS]
+    ws.append(headers)
+    for idx, (_, width) in enumerate(COLUMNS, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+        cell = ws.cell(row=1, column=idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+
+    ws.row_dimensions[1].height = 28
+    ws.freeze_panes = "B2"
+
+    body_align = Alignment(vertical="top", wrap_text=True)
+    for rec in records:
+        row = _record_to_row(rec)
+        ws.append(row)
+
+    # Apply alignment to body
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, len(COLUMNS) + 1):
+            ws.cell(row=r, column=c).alignment = body_align
+
+    # AutoFilter
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}{ws.max_row}"
+
+    tmp_path = xlsx_path.with_suffix(xlsx_path.suffix + ".tmp")
+    try:
+        wb.save(tmp_path)
+    except Exception as e:
+        log.error("Failed to write %s: %s", tmp_path, e)
+        return False
+
+    # Atomic replace
+    try:
+        os.replace(tmp_path, xlsx_path)
+        log.info("Registry written: %s (%d rows)", xlsx_path, len(records))
+        return True
+    except PermissionError as e:
+        log.warning(
+            "Could not replace %s (probably open in Excel). Kept %s. %s",
+            xlsx_path, tmp_path, e,
+        )
+        return False
+    except Exception as e:
+        log.error("os.replace failed: %s", e)
+        return False

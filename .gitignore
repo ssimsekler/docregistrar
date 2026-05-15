@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Project data (local state, never commit)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config (may contain absolute paths)
+config.yaml
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+logs/
