@@ -35,12 +35,19 @@ CREATE TABLE IF NOT EXISTS files (
     error TEXT NOT NULL DEFAULT '',
     indexed_at TEXT,
     used_thinking INTEGER NOT NULL DEFAULT 0,
-    extraction_json TEXT
+    extraction_json TEXT,
+    manually_edited INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
 """
+
+# Columns added in later schema versions; we ensure they exist via ALTER TABLE
+# at startup (safe to repeat — we check first).
+_LATER_COLUMNS = [
+    ("manually_edited", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 class Database:
@@ -61,6 +68,11 @@ class Database:
     def _init_db(self) -> None:
         with self._lock, self._connect() as conn:
             conn.executescript(DDL)
+            # Apply additive column migrations for existing DBs
+            existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+            for col_name, col_def in _LATER_COLUMNS:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_def}")
             cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
             row = cur.fetchone()
             if row is None:
@@ -146,18 +158,33 @@ class Database:
                 (status, error, relative_path),
             )
 
-    def reset_to_pending(self, relative_paths: Iterable[str]) -> int:
-        n = 0
+    def reset_to_pending(self, relative_paths: Iterable[str], *, force: bool = False) -> tuple[int, int]:
+        """Set rows back to 'pending' so they get re-processed.
+
+        If `force=False`, rows with manually_edited=1 are SKIPPED.
+        Returns (n_reset, n_skipped_due_to_manual_edit).
+        """
+        n_reset = 0
+        n_skipped = 0
         with self.conn() as c:
             for p in relative_paths:
+                row = c.execute(
+                    "SELECT manually_edited FROM files WHERE relative_path=?", (p,)
+                ).fetchone()
+                if row is None:
+                    continue
+                if not force and row["manually_edited"]:
+                    n_skipped += 1
+                    continue
                 cur = c.execute(
                     """UPDATE files SET status='pending', error='', extraction_json=NULL,
-                                        indexed_at=NULL, used_thinking=0
+                                        indexed_at=NULL, used_thinking=0,
+                                        manually_edited=0
                        WHERE relative_path=?""",
                     (p,),
                 )
-                n += cur.rowcount
-        return n
+                n_reset += cur.rowcount
+        return n_reset, n_skipped
 
     def reset_in_progress_to_pending(self) -> int:
         with self.conn() as c:
@@ -173,7 +200,13 @@ class Database:
         page_count: Optional[int],
         extraction: LLMExtraction,
         used_thinking: bool,
+        default_repository: str = "",
     ) -> None:
+        """Persist a fresh LLM extraction. If `default_repository` is set
+        and the extraction's repository is empty, fill it in.
+        """
+        if not extraction.repository and default_repository:
+            extraction = extraction.model_copy(update={"repository": default_repository})
         with self.conn() as c:
             c.execute(
                 """UPDATE files
@@ -188,6 +221,145 @@ class Database:
                     relative_path,
                 ),
             )
+
+    def update_fields(self, relative_path: str, fields: dict) -> bool:
+        """Edit a single row's fields. `fields` maps from the schema's
+        FileEditRequest fields. Marks row as manually_edited=1.
+
+        Special handling:
+          - 'status' / 'error' update the dedicated columns.
+          - 'persons'/'organizations'/'locations'/'mentioned_dates'/
+            'products_technologies' go INTO extraction_json.named_entities.
+          - All other LLM-style fields go INTO extraction_json.
+          - 'repository' goes INTO extraction_json.repository.
+        Returns True if the row existed.
+        """
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM files WHERE relative_path=?", (relative_path,)
+            ).fetchone()
+            if row is None:
+                return False
+
+            new_status = fields.pop("status", None)
+            new_error = fields.pop("error", None)
+
+            # Decode existing extraction_json (or build a fresh empty one)
+            ext_data: dict = {}
+            if row["extraction_json"]:
+                try:
+                    ext_data = json.loads(row["extraction_json"])
+                except Exception:
+                    ext_data = {}
+            ne_data = ext_data.get("named_entities") or {}
+
+            # Map named-entity-ish fields
+            ne_keys = {
+                "persons": "persons",
+                "organizations": "organizations",
+                "locations": "locations",
+                "mentioned_dates": "dates",
+                "products_technologies": "products_technologies",
+            }
+            for src, dst in ne_keys.items():
+                if src in fields:
+                    ne_data[dst] = fields.pop(src) or []
+
+            # Everything else goes top-level in ext_data
+            for k, v in list(fields.items()):
+                ext_data[k] = v if v is not None else ""
+
+            ext_data["named_entities"] = ne_data
+
+            # Re-validate via Pydantic to ensure we keep a consistent shape
+            try:
+                ne_obj = NamedEntities(**ne_data)
+                clean_top = {k: v for k, v in ext_data.items() if k != "named_entities"}
+                extraction = LLMExtraction(named_entities=ne_obj, **clean_top)
+                ext_json = extraction.model_dump_json()
+            except Exception:
+                ext_json = json.dumps(ext_data, ensure_ascii=False)
+
+            sets = ["extraction_json=?", "manually_edited=1"]
+            params: list[Any] = [ext_json]
+            if new_status is not None:
+                sets.append("status=?")
+                params.append(new_status)
+                # If user moves a manually-edited row back to pending, that's
+                # an explicit re-queue; clear the manual flag so the worker
+                # doesn't immediately skip it.
+                if new_status == "pending":
+                    sets[-2] = "manually_edited=0"
+                    sets.append("extraction_json=NULL")
+                    sets.append("indexed_at=NULL")
+                    sets.append("used_thinking=0")
+                    sets.append("error=''")
+                    params.pop(0)  # remove ext_json arg
+            if new_error is not None:
+                sets.append("error=?")
+                params.append(new_error)
+
+            sql = f"UPDATE files SET {', '.join(sets)} WHERE relative_path=?"
+            params.append(relative_path)
+            c.execute(sql, params)
+            return True
+
+    def bulk_set(self, relative_paths: Iterable[str], *,
+                 repository: Optional[str] = None,
+                 status: Optional[str] = None) -> int:
+        """Apply a status and/or repository to many files at once.
+
+        Sets manually_edited=1 on each affected row.
+        Returns number of rows affected.
+        """
+        n = 0
+        with self.conn() as c:
+            for p in relative_paths:
+                row = c.execute(
+                    "SELECT extraction_json FROM files WHERE relative_path=?", (p,)
+                ).fetchone()
+                if row is None:
+                    continue
+
+                if repository is not None:
+                    ext_data: dict = {}
+                    if row["extraction_json"]:
+                        try:
+                            ext_data = json.loads(row["extraction_json"])
+                        except Exception:
+                            ext_data = {}
+                    ext_data["repository"] = repository
+                    if "named_entities" not in ext_data:
+                        ext_data["named_entities"] = {}
+                    try:
+                        ne_obj = NamedEntities(**ext_data.get("named_entities", {}))
+                        clean_top = {k: v for k, v in ext_data.items() if k != "named_entities"}
+                        ext_json = LLMExtraction(named_entities=ne_obj, **clean_top).model_dump_json()
+                    except Exception:
+                        ext_json = json.dumps(ext_data, ensure_ascii=False)
+                    c.execute(
+                        "UPDATE files SET extraction_json=?, manually_edited=1 WHERE relative_path=?",
+                        (ext_json, p),
+                    )
+
+                if status is not None:
+                    if status == "pending":
+                        # Re-queue: clear extracted data and the manual flag
+                        c.execute(
+                            """UPDATE files SET status='pending', error='',
+                                                extraction_json=NULL, indexed_at=NULL,
+                                                used_thinking=0, manually_edited=0
+                               WHERE relative_path=?""",
+                            (p,),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE files SET status=?, manually_edited=1 WHERE relative_path=?",
+                            (status, p),
+                        )
+
+                n += 1
+        return n
 
     def next_pending(self) -> Optional[FileRecord]:
         with self.conn() as c:
@@ -275,6 +447,10 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
             extraction = LLMExtraction(named_entities=ne, **data)
         except Exception:
             extraction = None
+    try:
+        manually_edited = bool(row["manually_edited"])
+    except (KeyError, IndexError):
+        manually_edited = False
     return FileRecord(
         relative_path=row["relative_path"],
         file_name=row["file_name"],
@@ -289,4 +465,5 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         indexed_at=row["indexed_at"],
         extraction=extraction,
         used_thinking=bool(row["used_thinking"]),
+        manually_edited=manually_edited,
     )

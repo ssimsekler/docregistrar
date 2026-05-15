@@ -183,3 +183,18 @@ docregistrar/
 ## Privacy
 
 All extraction happens on your machine. The only network calls the agent makes are to `http://localhost:1234` (your LM Studio server). No telemetry, no cloud calls, no third-party APIs.
+
+---
+
+## v0.2 — what's new
+
+- **Folder picker (📂 Browse)** opens a native Windows folder dialog from the header.
+- **Repository field** — added to the schema, the registry, and the file-detail panel. Set the default in the header text box; it's recorded for every file processed from then on. Bulk-edit changes it for selected files.
+- **Edit mode** in the file detail panel — click any file row, then ✎ Edit to change the LLM-produced fields manually. File-system fields stay read-only. Status can be moved back to `pending` to re-queue a file. Manually edited rows are shown with ✎ in the table and are protected from automatic re-evaluation; use the **Force** button or per-file confirmation to override.
+- **Bulk edit** for selected files — appears as a second toolbar row when any rows are checked. Lets you set the **Repository** and/or the **Status** for many files at once.
+- **Download Excel any time** — the **⬇ Download .xlsx** button in the header generates a fresh Excel from the current state and downloads it via your browser, even while processing is running.
+- **Fast Stop / Ctrl+C** — Stop now closes the in-flight LM Studio HTTP socket so the worker exits within ~1 s instead of waiting for the LLM. Ctrl+C in `run.bat` triggers the same shutdown via FastAPI's lifespan hook.
+- **Worker stays alive while idle** — once you Start, the worker keeps running even when there are no pending files, so you can re-evaluate, edit-to-pending, or scan again without restarting. Only **Stop** ends it.
+- **Verbosity dropdown** (quiet / normal / verbose) controls how chatty the activity log is.
+- **Per-file step timings + sub-progress** in the detail panel: extract_text → llm_extract → save, each with a duration and a one-line detail.
+- **Total elapsed time** ticks in the header from when you click Start.

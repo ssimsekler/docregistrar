@@ -108,13 +108,29 @@ def _as_str_list(value: Any) -> list[str]:
 class LMClient:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
-        self._client = httpx.Client(
-            base_url=cfg.base_url,
-            timeout=cfg.request_timeout_seconds,
-            headers={"Authorization": f"Bearer {cfg.api_key}"},
+        self._cancelled = False
+        self._client = self._make_client()
+
+    def _make_client(self) -> httpx.Client:
+        return httpx.Client(
+            base_url=self.cfg.base_url,
+            timeout=self.cfg.request_timeout_seconds,
+            headers={"Authorization": f"Bearer {self.cfg.api_key}"},
         )
 
     def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        """Abort any in-flight request by closing the underlying client.
+
+        Safe to call from any thread. After calling, this client is dead;
+        the caller should create a new LMClient if it wants to do more work.
+        """
+        self._cancelled = True
         try:
             self._client.close()
         except Exception:
@@ -232,7 +248,10 @@ class LMClient:
 
         try:
             r = self._client.post("/chat/completions", json=body)
-        except httpx.HTTPError:
+        except (httpx.HTTPError, RuntimeError) as e:
+            # If we were cancelled, surface a clean error (don't retry).
+            if self._cancelled:
+                raise LLMError("cancelled") from e
             raise
 
         if r.status_code >= 400:

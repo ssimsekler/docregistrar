@@ -25,6 +25,7 @@ SHEET_NAME = "Documents"
 COLUMNS: list[tuple[str, int]] = [
     ("File name", 30),
     ("Relative path", 50),
+    ("Repository", 18),
     ("File size (bytes)", 14),
     ("SHA-256", 36),
     ("Extension", 10),
@@ -52,6 +53,7 @@ COLUMNS: list[tuple[str, int]] = [
     ("Industry domain", 20),
     ("Quality score", 10),
     ("Used thinking", 10),
+    ("Manually edited", 12),
     ("Status", 12),
     ("Error", 30),
     ("Indexed at", 20),
@@ -69,6 +71,7 @@ def _record_to_row(rec: FileRecord) -> list:
     return [
         rec.file_name,
         rec.relative_path,
+        (e.repository if e else ""),
         rec.file_size,
         rec.sha256,
         rec.extension,
@@ -96,6 +99,7 @@ def _record_to_row(rec: FileRecord) -> list:
         (e.industry_domain if e else ""),
         (round(e.quality_score, 3) if e else ""),
         ("Yes" if rec.used_thinking else ""),
+        ("Yes" if rec.manually_edited else ""),
         rec.status,
         rec.error or "",
         rec.indexed_at or "",
@@ -163,3 +167,47 @@ def write_registry(records: list[FileRecord], xlsx_path: Path) -> bool:
     except Exception as e:
         log.error("os.replace failed: %s", e)
         return False
+
+
+def build_registry_bytes(records: list[FileRecord]) -> bytes:
+    """Build the registry workbook in memory and return its bytes.
+
+    Used by the GET /api/registry.xlsx endpoint so users can download the
+    current state at any time, even while processing is running.
+    """
+    import io
+
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        ws = wb.create_sheet(SHEET_NAME)
+    ws.title = SHEET_NAME
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFFFF")
+    header_align = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+    headers = [c[0] for c in COLUMNS]
+    ws.append(headers)
+    for idx, (_, width) in enumerate(COLUMNS, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+        cell = ws.cell(row=1, column=idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+
+    ws.row_dimensions[1].height = 28
+    ws.freeze_panes = "B2"
+
+    body_align = Alignment(vertical="top", wrap_text=True)
+    for rec in records:
+        ws.append(_record_to_row(rec))
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, len(COLUMNS) + 1):
+            ws.cell(row=r, column=c).alignment = body_align
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}{ws.max_row}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

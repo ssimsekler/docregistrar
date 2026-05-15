@@ -34,6 +34,7 @@ class LLMExtraction(BaseModel):
     geographic_scope: str = ""
     industry_domain: str = ""
     quality_score: float = 0.0              # 0..1, model self-rated
+    repository: str = ""                    # user-assigned, NOT extracted by the LLM
 
 
 # -------- File record (one per file) --------
@@ -55,6 +56,7 @@ class FileRecord(BaseModel):
     indexed_at: Optional[str] = None
     extraction: Optional[LLMExtraction] = None
     used_thinking: bool = False
+    manually_edited: bool = False           # True if user has edited any field; protects from auto re-eval
 
 
 # -------- API DTOs --------
@@ -62,11 +64,53 @@ class FileRecord(BaseModel):
 class StartRequest(BaseModel):
     target_folder: str
     registry_xlsx: str = ""
+    default_repository: str = ""
+
+
+class SetRepositoryRequest(BaseModel):
+    repository: str = ""
 
 
 class ReevaluateRequest(BaseModel):
     relative_paths: list[str]
     use_thinking: bool = False
+    force: bool = False                    # if True, overwrite manually-edited rows
+
+
+class FileEditRequest(BaseModel):
+    """All fields are optional; only provided fields are updated."""
+    # Status / housekeeping
+    status: Optional[FileStatus] = None
+    error: Optional[str] = None
+    # User-managed
+    repository: Optional[str] = None
+    # LLM-style fields (any may be edited)
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    document_date: Optional[str] = None
+    last_update_date: Optional[str] = None
+    document_type: Optional[str] = None
+    language: Optional[str] = None
+    authors: Optional[list[str]] = None
+    version: Optional[str] = None
+    confidentiality: Optional[str] = None
+    geographic_scope: Optional[str] = None
+    industry_domain: Optional[str] = None
+    key_concepts: Optional[list[str]] = None
+    key_phrases: Optional[list[str]] = None
+    tags: Optional[list[str]] = None
+    quality_score: Optional[float] = None
+    persons: Optional[list[str]] = None
+    organizations: Optional[list[str]] = None
+    locations: Optional[list[str]] = None
+    mentioned_dates: Optional[list[str]] = None
+    products_technologies: Optional[list[str]] = None
+
+
+class BulkEditRequest(BaseModel):
+    relative_paths: list[str]
+    repository: Optional[str] = None
+    status: Optional[FileStatus] = None
 
 
 class FileStep(BaseModel):

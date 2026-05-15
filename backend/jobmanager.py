@@ -51,6 +51,8 @@ class _State:
     current_file: str = ""
     started_at: Optional[str] = None
     last_message: str = ""
+    # Default repository assigned to files that get processed during this run.
+    default_repository: str = ""
     # Re-evaluation overrides keyed by relative_path
     thinking_overrides: dict[str, bool] = field(default_factory=dict)
     # Per-file fine-grained progress
@@ -72,6 +74,10 @@ class JobManager:
         self._wakeup = threading.Event()  # wake worker when new files queued
 
         self._thread: Optional[threading.Thread] = None
+
+        # Reference to the live LM Studio client so Stop can close its socket
+        # to interrupt an in-flight LLM call.
+        self._llm_client: Optional[LMClient] = None
 
         # Bridge for WebSocket: list of asyncio.Queue, populated from any thread.
         self._listeners: list[asyncio.Queue] = []
@@ -128,9 +134,13 @@ class JobManager:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self, target_folder: str, registry_xlsx: str = "") -> None:
+    def start(self, target_folder: str, registry_xlsx: str = "",
+              default_repository: str = "") -> None:
         if self.is_running() and self._state.state not in ("paused",):
-            self._set_message("Already running.")
+            # Just update the default repository if running
+            with self._lock:
+                self._state.default_repository = default_repository or self._state.default_repository
+            self._set_message("Already running; default repository updated.")
             return
 
         target = Path(target_folder).expanduser().resolve()
@@ -140,6 +150,8 @@ class JobManager:
 
         # If we were paused, just resume.
         if self.is_running() and self._state.state == "paused":
+            with self._lock:
+                self._state.default_repository = default_repository or self._state.default_repository
             self.resume()
             return
 
@@ -151,6 +163,7 @@ class JobManager:
                 or str(target / "registry.xlsx")
             )
             self._state.started_at = now_iso()
+            self._state.default_repository = default_repository or ""
             self._state.thinking_overrides.clear()
 
         # Recover any "processing" rows from a prior crash
@@ -187,17 +200,48 @@ class JobManager:
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused
         self._wakeup.set()
+        # Forcibly close the in-flight LLM HTTP socket so the worker
+        # exits its httpx.post() within milliseconds instead of waiting
+        # for the LLM to finish.
+        client = self._llm_client
+        if client is not None:
+            try:
+                client.cancel()
+            except Exception:
+                pass
 
-    def reevaluate(self, relative_paths: list[str], use_thinking: bool = False) -> int:
-        """Reset the given files to 'pending' (will be picked up on next scan loop)."""
-        n = self.db.reset_to_pending(relative_paths)
+    def shutdown_blocking(self, timeout: float = 5.0) -> None:
+        """Used by FastAPI shutdown hook (Ctrl+C). Like stop() but
+        also joins the worker thread so uvicorn can exit cleanly.
+        """
+        self.stop()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=timeout)
+
+    def reevaluate(self, relative_paths: list[str], use_thinking: bool = False,
+                   force: bool = False) -> tuple[int, int]:
+        """Reset the given files to 'pending' (will be picked up on next scan loop).
+
+        Returns (n_reset, n_skipped_due_to_manual_edit).
+        Edited rows are skipped unless `force=True`.
+        """
+        n_reset, n_skipped = self.db.reset_to_pending(relative_paths, force=force)
         if use_thinking:
             with self._lock:
                 for p in relative_paths:
                     self._state.thinking_overrides[p] = True
-        self._set_message(f"Queued {n} file(s) for re-evaluation (thinking={use_thinking}).")
+        msg = f"Queued {n_reset} file(s) for re-evaluation (thinking={use_thinking})"
+        if n_skipped:
+            msg += f"; skipped {n_skipped} manually-edited file(s) (use Force to override)"
+        self._set_message(msg + ".")
         self._wakeup.set()
-        return n
+        return n_reset, n_skipped
+
+    def set_default_repository(self, repository: str) -> None:
+        with self._lock:
+            self._state.default_repository = repository or ""
+        self._set_message(f"Default repository set to: {repository!r}")
 
     # --------------- worker thread ---------------
 
@@ -288,6 +332,7 @@ class JobManager:
     def _process_loop(self) -> None:
         cfg = self.cfg
         client = LMClient(cfg.llm)
+        self._llm_client = client
         try:
             processed_since_xlsx = 0
             while not self._stop_event.is_set():
@@ -301,8 +346,10 @@ class JobManager:
 
                 rec = self.db.next_pending()
                 if rec is None:
-                    # No more pending. Wait for a poke or stop.
-                    self._set_state("running", "All caught up. Waiting for new work...")
+                    # No more pending. Stay alive (don't exit) — wait for a
+                    # poke (re-evaluate, edit-to-pending, scan added work) or
+                    # an explicit Stop.
+                    self._set_state("running", "Idle — no pending work; waiting...")
                     self._regenerate_excel()
                     processed_since_xlsx = 0
                     self._wakeup.wait(timeout=5.0)
@@ -314,8 +361,25 @@ class JobManager:
                     self._state.current_file = rec.relative_path
                 self._broadcast_progress()
 
+                # If we got cancelled mid-flight, the LLM client is now dead.
+                # Re-create it so the next iteration can talk to LM Studio.
+                if client._cancelled:  # noqa: SLF001 (intentional)
+                    log.info("LLM client was cancelled; recreating.")
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    client = LMClient(cfg.llm)
+                    self._llm_client = client
+
                 ok = self._process_one(client, rec)
                 processed_since_xlsx += 1
+
+                # If Stop was pressed during this file, requeue it
+                if self._stop_event.is_set():
+                    self.db.mark_status(rec.relative_path, "pending", "")
+                    self._set_message(f"Requeued {rec.relative_path} (stopped during processing)")
+                    break
 
                 if ok and processed_since_xlsx >= cfg.excel_write_every_n_files:
                     self._regenerate_excel()
@@ -324,7 +388,11 @@ class JobManager:
             # Drain
             self._regenerate_excel()
         finally:
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
+            self._llm_client = None
 
     def _process_one(self, client: LMClient, rec) -> bool:
         cfg = self.cfg
@@ -394,11 +462,14 @@ class JobManager:
 
             # ---- Step 3: persist ----
             self._begin_step("save", percent=95, detail="Saving to local DB...")
+            with self._lock:
+                default_repo = self._state.default_repository
             self.db.save_extraction(
                 relative_path=rec.relative_path,
                 page_count=res.page_count,
                 extraction=extraction,
                 used_thinking=used_thinking,
+                default_repository=default_repo,
             )
             self._end_step("save", percent=100, detail="Saved")
 
