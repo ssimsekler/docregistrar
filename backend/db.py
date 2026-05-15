@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-from .schemas import FileRecord, LLMExtraction, NamedEntities, now_iso
+from .schemas import FileRecord, KVPair, LLMExtraction, MAX_CUSTOM_PROPERTIES, NamedEntities, now_iso
 
 SCHEMA_VERSION = 1
 
@@ -204,9 +204,35 @@ class Database:
     ) -> None:
         """Persist a fresh LLM extraction. If `default_repository` is set
         and the extraction's repository is empty, fill it in.
+
+        Preserves any user-defined `custom_properties` from the previous
+        extraction (the LLM never produces them).
         """
         if not extraction.repository and default_repository:
             extraction = extraction.model_copy(update={"repository": default_repository})
+
+        # Preserve previously-saved custom_properties
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT extraction_json FROM files WHERE relative_path=?", (relative_path,)
+            ).fetchone()
+        prev_custom: list[KVPair] = []
+        if row and row["extraction_json"]:
+            try:
+                prev = json.loads(row["extraction_json"])
+                raw_cp = prev.get("custom_properties") or []
+                if isinstance(raw_cp, list):
+                    for item in raw_cp[:MAX_CUSTOM_PROPERTIES]:
+                        if isinstance(item, dict):
+                            prev_custom.append(
+                                KVPair(key=str(item.get("key", "")),
+                                       value=str(item.get("value", "")))
+                            )
+            except Exception:
+                pass
+        if prev_custom and not extraction.custom_properties:
+            extraction = extraction.model_copy(update={"custom_properties": prev_custom})
+
         with self.conn() as c:
             c.execute(
                 """UPDATE files
@@ -264,6 +290,18 @@ class Database:
             for src, dst in ne_keys.items():
                 if src in fields:
                     ne_data[dst] = fields.pop(src) or []
+
+            # Custom properties: list of {key,value}; clamp size & coerce
+            if "custom_properties" in fields:
+                raw_cp = fields.pop("custom_properties") or []
+                cleaned: list[dict] = []
+                for item in raw_cp[:MAX_CUSTOM_PROPERTIES]:
+                    if isinstance(item, dict):
+                        k = str(item.get("key", "")).strip()
+                        v = str(item.get("value", "")).strip()
+                        if k or v:
+                            cleaned.append({"key": k, "value": v})
+                ext_data["custom_properties"] = cleaned
 
             # Everything else goes top-level in ext_data
             for k, v in list(fields.items()):

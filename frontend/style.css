@@ -115,11 +115,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 360px;
+  grid-template-columns: 1fr 6px var(--right-width, 460px);
   min-height: 0;
 }
-.main.with-detail {
-  grid-template-columns: 1fr 460px;
+
+/* Vertical splitter between table and side panel */
+.splitter {
+  width: 6px;
+  cursor: col-resize;
+  background: var(--border);
+  transition: background 0.15s ease;
+}
+.splitter:hover, .splitter.dragging {
+  background: var(--accent);
 }
 
 .table-wrap {
@@ -329,3 +337,42 @@ tbody tr { cursor: pointer; }
 .step-name { font-weight: 600; }
 .step-time { font-variant-numeric: tabular-nums; color: var(--muted); }
 .step-detail { word-break: break-word; }
+
+/* ---------- Custom properties (KV) editor ---------- */
+.kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kv-row {
+  display: grid;
+  grid-template-columns: 1fr 2fr 28px;
+  gap: 6px;
+  align-items: center;
+}
+.kv-row input {
+  width: 100%;
+  padding: 5px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12.5px;
+}
+.kv-row .kv-key   { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.kv-row button.kv-remove {
+  padding: 2px 6px;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+}
+.kv-row button.kv-remove:hover { background: var(--red); border-color: var(--red); color: #fff; }
+
+.kv-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.kv-status { color: var(--muted); font-size: 12px; }

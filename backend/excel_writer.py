@@ -57,7 +57,36 @@ COLUMNS: list[tuple[str, int]] = [
     ("Status", 12),
     ("Error", 30),
     ("Indexed at", 20),
+    ("Custom properties", 60),
 ]
+
+
+def _format_custom_properties(items) -> str:
+    """Render a list of {key,value} as 'k1: v1 | k2: v2 | ...'.
+
+    Pipe characters inside values are escaped as '\\|' so the cell remains
+    parseable.
+    """
+    if not items:
+        return ""
+    parts: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            # Pydantic KVPair instance
+            try:
+                k = str(getattr(it, "key", "") or "")
+                v = str(getattr(it, "value", "") or "")
+            except Exception:
+                continue
+        else:
+            k = str(it.get("key", "") or "")
+            v = str(it.get("value", "") or "")
+        k = k.strip()
+        v = v.strip().replace("|", r"\|")
+        if not k and not v:
+            continue
+        parts.append(f"{k}: {v}" if k else v)
+    return " | ".join(parts)
 
 
 def _join(items: list[str] | None) -> str:
@@ -103,6 +132,7 @@ def _record_to_row(rec: FileRecord) -> list:
         rec.status,
         rec.error or "",
         rec.indexed_at or "",
+        _format_custom_properties(e.custom_properties) if e else "",
     ]
 
 

@@ -227,6 +227,7 @@ def api_files(
         d["industry_domain"] = e.get("industry_domain", "")
         d["repository"] = e.get("repository", "")
         d["products_technologies"] = ne.get("products_technologies", [])
+        d["custom_properties"] = e.get("custom_properties", [])
         out.append(d)
     return {"items": out, "count": len(out)}
 

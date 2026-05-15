@@ -100,12 +100,17 @@ function stringToList(s) {
   return (s || "").split(";").map(x => x.trim()).filter(Boolean);
 }
 
+const MAX_CUSTOM_PROPERTIES = 50;
+
 function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate, onEdited }) {
   const [rec, setRec] = useState(null);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({});
+  // Custom properties are edited independently of the main "Edit" mode
+  const [kv, setKv] = useState([]);                 // [{key, value}]
+  const [kvSavingHint, setKvSavingHint] = useState("");
 
   const isCurrent = currentProgress && currentProgress.relative_path === relativePath;
 
@@ -142,9 +147,37 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
         products_technologies: listToString(ne.products_technologies),
         status: r.status,
       });
+      // Custom properties (independent edit)
+      const cp = Array.isArray(e.custom_properties) ? e.custom_properties : [];
+      setKv(cp.map(p => ({ key: p.key || "", value: p.value || "" })));
+      setKvSavingHint("");
     } catch (e) { setErr(e.message); setRec(null); }
     finally { setLoading(false); }
   }, [relativePath]);
+
+  const addKv = () => {
+    setKv(prev => prev.length >= MAX_CUSTOM_PROPERTIES ? prev : [...prev, { key: "", value: "" }]);
+  };
+  const updateKv = (i, field, val) => {
+    setKv(prev => prev.map((p, idx) => idx === i ? { ...p, [field]: val } : p));
+  };
+  const removeKv = (i) => {
+    setKv(prev => prev.filter((_, idx) => idx !== i));
+  };
+  const saveKv = async () => {
+    // Trim and drop fully-empty rows
+    const cleaned = kv
+      .map(p => ({ key: (p.key || "").trim(), value: (p.value || "").trim() }))
+      .filter(p => p.key || p.value)
+      .slice(0, MAX_CUSTOM_PROPERTIES);
+    try {
+      await api("POST", `/api/file/edit?relative_path=${encodeURIComponent(relativePath)}`,
+                { custom_properties: cleaned });
+      setKvSavingHint(`Saved ${cleaned.length} custom propert${cleaned.length === 1 ? "y" : "ies"}.`);
+      await load();
+      onEdited && onEdited();
+    } catch (e) { alert(e.message); }
+  };
 
   useEffect(() => { load(); }, [load]);
 
@@ -218,13 +251,19 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
           <div className="detail-path muted">{relativePath}</div>
         </div>
         <div className="detail-actions">
-          {!editing && <button onClick={() => setEditing(true)}>✎ Edit</button>}
-          {editing && <button className="primary" onClick={saveEdits}>💾 Save</button>}
-          {editing && <button onClick={() => { setEditing(false); load(); }}>Cancel</button>}
-          {!editing && <button onClick={() => onReevaluate(relativePath, false)}>↻ Re-eval</button>}
-          {!editing && <button onClick={() => onReevaluate(relativePath, true)} title="Re-run with thinking mode">↻ + 🧠</button>}
-          <button onClick={load}>🔄</button>
-          <button onClick={onClose}>✕</button>
+          {!editing && <button onClick={() => setEditing(true)}
+                               title="Enter edit mode for the LLM-produced fields, status, and named entities">✎ Edit</button>}
+          {editing && <button className="primary" onClick={saveEdits}
+                              title="Save edits and exit edit mode">💾 Save</button>}
+          {editing && <button onClick={() => { setEditing(false); load(); }}
+                              title="Discard edits and reload the saved values">Cancel</button>}
+          {!editing && <button onClick={() => onReevaluate(relativePath, false)}
+                               title="Queue this file for re-evaluation by the LLM (skipped if manually edited)">↻ Re-eval</button>}
+          {!editing && <button onClick={() => onReevaluate(relativePath, true)}
+                               title="Re-evaluate using the model's slower 'thinking' mode for higher quality">↻ + 🧠</button>}
+          <button onClick={load}
+                  title="Reload this file's data from the server (useful after external changes)">🔄</button>
+          <button onClick={onClose} title="Close this details panel and show the activity log">✕</button>
         </div>
       </div>
 
@@ -327,6 +366,58 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               return <PropRow key={k} label={label} value={e[k]} />;
             })}
           </div>
+
+          {/* Custom properties (independent of Edit mode) */}
+          <div className="card">
+            <div className="card-title" title="User-defined key/value pairs. Saved per file. Included in the Excel export.">
+              Custom properties ({kv.length}/{MAX_CUSTOM_PROPERTIES})
+            </div>
+            <div className="kv-list">
+              {kv.length === 0 && (
+                <div className="muted" style={{ fontSize: "12px" }}>
+                  No custom properties yet. Click <b>+ Add</b> to create one.
+                </div>
+              )}
+              {kv.map((p, i) => (
+                <div className="kv-row" key={i}>
+                  <input
+                    className="kv-key"
+                    type="text"
+                    placeholder="key"
+                    value={p.key}
+                    onChange={ev => updateKv(i, "key", ev.target.value)}
+                    title="Property key (free text)"
+                  />
+                  <input
+                    type="text"
+                    placeholder="value"
+                    value={p.value}
+                    onChange={ev => updateKv(i, "value", ev.target.value)}
+                    title="Property value (free text)"
+                  />
+                  <button className="kv-remove" onClick={() => removeKv(i)}
+                          title="Remove this key/value pair">🗑</button>
+                </div>
+              ))}
+            </div>
+            <div className="kv-actions">
+              <button onClick={addKv}
+                      disabled={kv.length >= MAX_CUSTOM_PROPERTIES}
+                      title={kv.length >= MAX_CUSTOM_PROPERTIES
+                        ? `Limit reached (${MAX_CUSTOM_PROPERTIES})`
+                        : "Add a new custom property row"}>
+                ➕ Add property
+              </button>
+              <button className="primary" onClick={saveKv}
+                      title="Save custom properties to this file (writes to local DB and to registry.xlsx on next checkpoint)">
+                💾 Save custom
+              </button>
+              {kvSavingHint && <span className="kv-status">{kvSavingHint}</span>}
+              <span className="kv-status muted" style={{ marginLeft: "auto" }}>
+                Excel format: <code>k1: v1 | k2: v2 | …</code>
+              </span>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -356,9 +447,37 @@ function App() {
   // Bulk-edit input states
   const [bulkRepo, setBulkRepo] = useState("");
   const [bulkStatus, setBulkStatus] = useState("");
+  // Right-panel width (resizable, persisted)
+  const [rightWidth, setRightWidth] = useState(() => {
+    const saved = parseInt(localStorage.getItem("docregistrar.rightWidth") || "", 10);
+    if (!Number.isNaN(saved) && saved >= 280 && saved <= 1600) return saved;
+    return 460;
+  });
+  const [dragging, setDragging] = useState(false);
   const wsRef = useRef(null);
   const verbosityRef = useRef(verbosity);
   useEffect(() => { verbosityRef.current = verbosity; }, [verbosity]);
+
+  // Splitter drag handlers (mouse on whole window so pointer can leave splitter)
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e) => {
+      const min = 280;
+      const max = Math.max(min + 100, window.innerWidth - 320);
+      const w = Math.min(max, Math.max(min, window.innerWidth - e.clientX));
+      setRightWidth(w);
+    };
+    const onUp = () => {
+      setDragging(false);
+      try { localStorage.setItem("docregistrar.rightWidth", String(rightWidth)); } catch {}
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [dragging, rightWidth]);
 
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
@@ -541,6 +660,7 @@ function App() {
             onChange={e => setFolder(e.target.value)}
             disabled={running && !paused}
             style={{ flex: 2 }}
+            title="Absolute path to the folder to scan. Use forward slashes on Windows."
           />
           <button onClick={onBrowse} disabled={running && !paused} title="Open folder picker">
             📂 Browse
@@ -551,14 +671,19 @@ function App() {
             value={repository}
             onChange={e => setRepository(e.target.value)}
             style={{ flex: 1, minWidth: 220 }}
+            title="Default Repository value tagged on every file processed from now on. Use 'Apply repo' to update mid-run."
           />
           <button onClick={onUpdateRepo} title="Apply repository to files processed from now on">
             Apply repo
           </button>
-          {!running && <button className="primary" onClick={onStart}>▶ Start</button>}
-          {running && !paused && <button onClick={onPause}>⏸ Pause</button>}
-          {paused && <button className="primary" onClick={onResume}>▶ Resume</button>}
-          {running && <button className="danger" onClick={onStop}>⏹ Stop</button>}
+          {!running && <button className="primary" onClick={onStart}
+                               title="Scan the target folder and start processing pending files">▶ Start</button>}
+          {running && !paused && <button onClick={onPause}
+                                          title="Pause processing between files (resume later from the same point)">⏸ Pause</button>}
+          {paused && <button className="primary" onClick={onResume}
+                              title="Resume processing">▶ Resume</button>}
+          {running && <button className="danger" onClick={onStop}
+                              title="Stop the worker. The currently-processing file (if any) is requeued as pending. Returns to idle within ~1s.">⏹ Stop</button>}
           <button onClick={onDownload} title="Download current registry as Excel">
             ⬇ Download .xlsx
           </button>
@@ -583,11 +708,13 @@ function App() {
         </div>
       </div>
 
-      <div className={`main ${openedPath ? "with-detail" : ""}`}>
+      <div className="main"
+           style={{ "--right-width": `${rightWidth}px` }}>
         <div style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
           <div className="toolbar">
             <label>Status:</label>
-            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
+                    title="Filter the table by file status">
               <option value="">all</option>
               <option value="pending">pending</option>
               <option value="processing">processing</option>
@@ -600,24 +727,29 @@ function App() {
               placeholder="search filename or path..."
               value={search}
               onChange={e => setSearch(e.target.value)}
+              title="Filter the table by a substring of the filename or relative path"
             />
-            <button onClick={refreshFiles}>↻ Refresh</button>
+            <button onClick={refreshFiles} title="Reload the file list from the server">↻ Refresh</button>
             <div className="spacer"></div>
             <label>Verbosity:</label>
-            <select value={verbosity} onChange={e => setVerbosity(e.target.value)}>
+            <select value={verbosity} onChange={e => setVerbosity(e.target.value)}
+                    title="How chatty the activity log on the right should be">
               <option value="quiet">quiet</option>
               <option value="normal">normal</option>
               <option value="verbose">verbose</option>
             </select>
-            <label><input type="checkbox" className="checkbox"
-                          checked={useThinking}
-                          onChange={e => setUseThinking(e.target.checked)} />
-              {" "}thinking mode</label>
-            <button className="primary" onClick={onReevaluateBatch} disabled={selected.size === 0}>
+            <label title="When checked, re-evaluations use the model's slower 'thinking' mode for higher quality">
+              <input type="checkbox" className="checkbox"
+                     checked={useThinking}
+                     onChange={e => setUseThinking(e.target.checked)} />
+              {" "}thinking mode
+            </label>
+            <button className="primary" onClick={onReevaluateBatch} disabled={selected.size === 0}
+                    title="Re-evaluate the selected files (manually-edited rows are skipped)">
               ↻ Re-evaluate {selected.size > 0 ? `(${selected.size})` : ""}
             </button>
             <button onClick={onReevaluateBatchForce} disabled={selected.size === 0}
-                    title="Force discards manual edits">
+                    title="Re-evaluate the selected files, INCLUDING manually-edited ones (their edits will be lost)">
               ↻ Force
             </button>
           </div>
@@ -702,6 +834,10 @@ function App() {
             </table>
           </div>
         </div>
+
+        <div className={`splitter ${dragging ? "dragging" : ""}`}
+             title="Drag to resize the side panel"
+             onMouseDown={() => setDragging(true)} />
 
         {openedPath ? (
           <FileDetailPanel

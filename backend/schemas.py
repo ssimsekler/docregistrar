@@ -17,6 +17,14 @@ class NamedEntities(BaseModel):
     products_technologies: list[str] = Field(default_factory=list)
 
 
+class KVPair(BaseModel):
+    key: str = ""
+    value: str = ""
+
+
+MAX_CUSTOM_PROPERTIES = 50
+
+
 class LLMExtraction(BaseModel):
     title: str = ""
     summary: str = ""                       # up to 2500 chars
@@ -35,6 +43,7 @@ class LLMExtraction(BaseModel):
     industry_domain: str = ""
     quality_score: float = 0.0              # 0..1, model self-rated
     repository: str = ""                    # user-assigned, NOT extracted by the LLM
+    custom_properties: list[KVPair] = Field(default_factory=list)  # user-defined K/V pairs
 
 
 # -------- File record (one per file) --------
@@ -105,6 +114,7 @@ class FileEditRequest(BaseModel):
     locations: Optional[list[str]] = None
     mentioned_dates: Optional[list[str]] = None
     products_technologies: Optional[list[str]] = None
+    custom_properties: Optional[list[KVPair]] = None
 
 
 class BulkEditRequest(BaseModel):
