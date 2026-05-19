@@ -114,20 +114,52 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .main {
   flex: 1;
-  display: grid;
-  grid-template-columns: 1fr 6px var(--right-width, 460px);
+  display: flex;
+  flex-direction: row;
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
-/* Vertical splitter between table and side panel */
+/* Left pane (file table + toolbars) */
+.main > .left-pane {
+  flex: 1 1 auto;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Right pane (file details OR activity log) */
+.main > .right-pane {
+  flex: 0 0 var(--right-width, 460px);
+  min-width: 280px;
+  max-width: calc(100vw - 320px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Vertical splitter between the two panes */
 .splitter {
-  width: 6px;
+  flex: 0 0 6px;
   cursor: col-resize;
   background: var(--border);
   transition: background 0.15s ease;
+  user-select: none;
 }
 .splitter:hover, .splitter.dragging {
   background: var(--accent);
+}
+
+/* While dragging the splitter, prevent text selection across the page */
+body.is-dragging-splitter,
+body.is-dragging-splitter * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 .table-wrap {
@@ -171,11 +203,11 @@ tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
 .status-skipped    { color: var(--amber); }
 
 .right-panel {
-  border-left: 1px solid var(--border);
   background: var(--panel);
   display: flex;
   flex-direction: column;
   min-height: 0;
+  height: 100%;
 }
 .right-panel h2 {
   margin: 0;
@@ -229,13 +261,70 @@ tbody tr.selected { background: rgba(59, 130, 246, 0.12); }
 tbody tr.opened { background: rgba(96, 165, 250, 0.18); }
 tbody tr { cursor: pointer; }
 
+/* Duplicate marker cell + row tint */
+tbody tr.dup-row td { box-shadow: inset 3px 0 0 var(--amber); }
+.dup-cell { color: var(--amber); font-weight: 700; }
+
+/* Active SHA filter pill in the toolbar */
+.active-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  color: var(--accent-2);
+  font-size: 12px;
+}
+.active-filter button {
+  padding: 0 4px;
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  color: var(--accent-2);
+  cursor: pointer;
+}
+.active-filter button:hover { color: var(--red); }
+
+/* Clickable SHA cell */
+.sha-cell {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--accent-2);
+  cursor: pointer;
+}
+.sha-cell:hover { text-decoration: underline; }
+
+/* Duplicates card sibling list */
+.dup-sibs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+.dup-sib-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.dup-sib-row:hover { background: rgba(59,130,246,0.10); }
+.dup-sib-row .dup-status {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
 /* ---------- File detail panel ---------- */
 .detail-panel {
-  border-left: 1px solid var(--border);
   background: var(--panel);
   display: flex;
   flex-direction: column;
   min-height: 0;
+  height: 100%;
 }
 .detail-head {
   display: flex;

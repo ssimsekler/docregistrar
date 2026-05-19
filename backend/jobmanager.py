@@ -324,9 +324,14 @@ class JobManager:
 
         # Remove DB rows for files no longer on disk
         removed = self.db.delete_files_not_in(present)
+
+        # Recompute duplicate flags authoritatively for the whole registry
+        n_groups = self.db.recompute_duplicates()
+
         self._set_message(
             f"Scan done. {n_seen} files seen, {n_added} queued, {n_unchanged} unchanged"
-            + (f", {removed} removed from registry." if removed else ".")
+            + (f", {removed} removed from registry" if removed else "")
+            + (f", {n_groups} duplicate group(s) detected." if n_groups else ".")
         )
 
     def _process_loop(self) -> None:

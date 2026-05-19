@@ -42,6 +42,7 @@ const STRING_FIELDS = [
   ["industry_domain", "Industry domain"],
   ["repository", "Repository"],
 ];
+const DESCRIPTION_MAX = 250;
 const LIST_FIELDS = [
   ["authors", "Authors"],
   ["key_concepts", "Key concepts"],
@@ -102,7 +103,7 @@ function stringToList(s) {
 
 const MAX_CUSTOM_PROPERTIES = 50;
 
-function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate, onEdited }) {
+function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate, onEdited, onOpenSibling }) {
   const [rec, setRec] = useState(null);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(false);
@@ -111,6 +112,8 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
   // Custom properties are edited independently of the main "Edit" mode
   const [kv, setKv] = useState([]);                 // [{key, value}]
   const [kvSavingHint, setKvSavingHint] = useState("");
+  // Duplicate siblings (other files with the same SHA-256)
+  const [siblings, setSiblings] = useState([]);
 
   const isCurrent = currentProgress && currentProgress.relative_path === relativePath;
 
@@ -125,6 +128,7 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
       const ne = e.named_entities || {};
       setDraft({
         title: e.title || "",
+        description: e.description || "",
         summary: e.summary || "",
         document_date: e.document_date || "",
         last_update_date: e.last_update_date || "",
@@ -181,6 +185,19 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
 
   useEffect(() => { load(); }, [load]);
 
+  // Load duplicate siblings whenever the record changes
+  useEffect(() => {
+    let aborted = false;
+    if (!rec || !rec.is_duplicate) {
+      setSiblings([]);
+      return;
+    }
+    api("GET", `/api/file/dup-siblings?relative_path=${encodeURIComponent(relativePath)}`)
+      .then(r => { if (!aborted) setSiblings(Array.isArray(r.siblings) ? r.siblings : []); })
+      .catch(() => { if (!aborted) setSiblings([]); });
+    return () => { aborted = true; };
+  }, [rec, relativePath]);
+
   // Auto-refresh while file is being processed (only when not editing)
   useEffect(() => {
     if (!isCurrent || editing) return;
@@ -218,6 +235,13 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
     if (cmpList(ne.locations, draft.locations))         payload.locations = stringToList(draft.locations);
     if (cmpList(ne.dates, draft.mentioned_dates))       payload.mentioned_dates = stringToList(draft.mentioned_dates);
     if (cmpList(ne.products_technologies, draft.products_technologies)) payload.products_technologies = stringToList(draft.products_technologies);
+
+    // Description (own card)
+    if (cmp(e.description ?? "", draft.description)) {
+      // Hard-cap at 250 chars defensively
+      const d = (draft.description || "").slice(0, DESCRIPTION_MAX);
+      payload.description = d;
+    }
 
     // Summary
     if (cmp(e.summary ?? "", draft.summary)) payload.summary = draft.summary;
@@ -323,7 +347,39 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             <PropRow label="Indexed at" value={rec.indexed_at} />
             <PropRow label="Used thinking" value={rec.used_thinking ? "Yes" : "No"} />
             <PropRow label="Manually edited" value={rec.manually_edited ? "Yes" : "No"} />
+            <PropRow label="Is duplicate" value={rec.is_duplicate ? "Yes" : "No"} />
           </div>
+
+          {/* Duplicates card (only if this file has siblings sharing its SHA-256) */}
+          {rec.is_duplicate && (
+            <div className="card">
+              <div className="card-title"
+                   title="Other files with byte-identical content (same SHA-256). Click a row to open it.">
+                🟰 Duplicates ({siblings.length} other file{siblings.length === 1 ? "" : "s"} with the same SHA-256)
+              </div>
+              {siblings.length === 0 && (
+                <div className="muted" style={{ fontSize: "12px" }}>
+                  Loading siblings…
+                </div>
+              )}
+              <div className="dup-sibs">
+                {siblings.slice(0, 20).map(s => (
+                  <div className="dup-sib-row" key={s.relative_path}
+                       onClick={() => onOpenSibling && onOpenSibling(s.relative_path)}
+                       title={`Open: ${s.relative_path}`}>
+                    <span className={`dup-status status-${s.status}`}>{s.status}</span>
+                    <span className="truncate" style={{ flex: 1 }}>{s.relative_path}</span>
+                    <span className="muted">{fmtBytes(s.file_size)}</span>
+                  </div>
+                ))}
+                {siblings.length > 20 && (
+                  <div className="muted" style={{ fontSize: "11px", padding: "4px 6px" }}>
+                    … and {siblings.length - 20} more (use "Filter by SHA-256" in the toolbar to see them all)
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Extracted properties */}
           <div className="card">
@@ -339,6 +395,32 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               : <PropRow label="Quality score"
                          value={e.quality_score != null ? Number(e.quality_score).toFixed(2) : ""} />
             }
+          </div>
+
+          <div className="card">
+            <div className="card-title"
+                 title={`A short factual gist of the document (max ${DESCRIPTION_MAX} chars). Distinct from Summary.`}>
+              Description {editing && `(editable, max ${DESCRIPTION_MAX} chars)`}
+            </div>
+            {editing ? (
+              <div className="prop-row">
+                <div className="prop-label">Description</div>
+                <div className="prop-value">
+                  <textarea
+                    value={draft.description ?? ""}
+                    onChange={ev => setField("description", ev.target.value.slice(0, DESCRIPTION_MAX))}
+                    rows={3}
+                    style={{ width: "100%" }}
+                    title={`Up to ${DESCRIPTION_MAX} chars. Auto-trimmed.`}
+                  />
+                  <div className="muted" style={{ fontSize: "11px", textAlign: "right" }}>
+                    {(draft.description || "").length} / {DESCRIPTION_MAX}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="summary-text">{e.description || <span className="muted">—</span>}</div>
+            )}
           </div>
 
           <div className="card">
@@ -438,6 +520,8 @@ function App() {
   const [files, setFiles] = useState([]);
   const [statusFilter, setStatusFilter] = useState("");
   const [search, setSearch] = useState("");
+  const [shaFilter, setShaFilter] = useState("");      // exact-match SHA-256 filter
+  const [dupOnly, setDupOnly] = useState(false);       // show only duplicates
   const [selected, setSelected] = useState(new Set());
   const [logLines, setLogLines] = useState([]);
   const [useThinking, setUseThinking] = useState(false);
@@ -460,7 +544,11 @@ function App() {
 
   // Splitter drag handlers (mouse on whole window so pointer can leave splitter)
   useEffect(() => {
-    if (!dragging) return;
+    if (!dragging) {
+      document.body.classList.remove("is-dragging-splitter");
+      return;
+    }
+    document.body.classList.add("is-dragging-splitter");
     const onMove = (e) => {
       const min = 280;
       const max = Math.max(min + 100, window.innerWidth - 320);
@@ -476,6 +564,7 @@ function App() {
     return () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("is-dragging-splitter");
     };
   }, [dragging, rightWidth]);
 
@@ -529,10 +618,16 @@ function App() {
 
   const refreshFiles = useCallback(async () => {
     try {
-      const r = await api("GET", `/api/files?status=${encodeURIComponent(statusFilter)}&search=${encodeURIComponent(search)}&limit=2000`);
+      const params = new URLSearchParams();
+      if (statusFilter) params.set("status", statusFilter);
+      if (search) params.set("search", search);
+      if (shaFilter) params.set("sha256", shaFilter);
+      if (dupOnly) params.set("duplicates_only", "true");
+      params.set("limit", "2000");
+      const r = await api("GET", `/api/files?${params.toString()}`);
       setFiles(r.items);
     } catch (e) { console.error(e); }
-  }, [statusFilter, search]);
+  }, [statusFilter, search, shaFilter, dupOnly]);
 
   useEffect(() => {
     refreshFiles();
@@ -626,6 +721,20 @@ function App() {
     } catch (e) { alert(e.message); }
   };
 
+  const onSkipDupSiblings = async () => {
+    if (selected.size === 0) { alert("Select at least one file."); return; }
+    if (!confirm(
+      `For each selected file, every OTHER file with the same SHA-256 will be marked as 'skipped'. The selected files themselves are NOT modified.\n\nProceed?`
+    )) return;
+    try {
+      const r = await api("POST", "/api/files/skip-dup-siblings", {
+        relative_paths: Array.from(selected),
+      });
+      alert(`Marked ${r.updated} duplicate sibling(s) as skipped.`);
+      refreshFiles();
+    } catch (e) { alert(e.message); }
+  };
+
   const toggleSel = (rp) => {
     const s = new Set(selected);
     if (s.has(rp)) s.delete(rp); else s.add(rp);
@@ -710,7 +819,7 @@ function App() {
 
       <div className="main"
            style={{ "--right-width": `${rightWidth}px` }}>
-        <div style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <div className="left-pane">
           <div className="toolbar">
             <label>Status:</label>
             <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
@@ -730,6 +839,19 @@ function App() {
               title="Filter the table by a substring of the filename or relative path"
             />
             <button onClick={refreshFiles} title="Reload the file list from the server">↻ Refresh</button>
+            <label title="Show only files that have at least one duplicate (same SHA-256) in the registry">
+              <input type="checkbox" className="checkbox"
+                     checked={dupOnly}
+                     onChange={e => setDupOnly(e.target.checked)} />
+              {" "}duplicates only
+            </label>
+            {shaFilter && (
+              <span className="active-filter" title={`Filtering by SHA-256: ${shaFilter}`}>
+                SHA: {shaFilter.slice(0, 8)}…
+                <button onClick={() => setShaFilter("")}
+                        title="Clear the SHA-256 filter">×</button>
+              </span>
+            )}
             <div className="spacer"></div>
             <label>Verbosity:</label>
             <select value={verbosity} onChange={e => setVerbosity(e.target.value)}
@@ -836,30 +958,32 @@ function App() {
         </div>
 
         <div className={`splitter ${dragging ? "dragging" : ""}`}
-             title="Drag to resize the side panel"
+             title="Drag to resize the side panel. Width is remembered across reloads."
              onMouseDown={() => setDragging(true)} />
 
-        {openedPath ? (
-          <FileDetailPanel
-            relativePath={openedPath}
-            currentProgress={cfp}
-            onClose={() => setOpenedPath("")}
-            onReevaluate={onReevaluateOne}
-            onEdited={refreshFiles}
-          />
-        ) : (
-          <div className="right-panel">
-            <h2>Activity log</h2>
-            <div className="log">
-              {logLines.map((l, i) => (
-                <div className="line" key={i}>
-                  <span className="ts">{l.ts}</span>{l.text}
-                </div>
-              ))}
-              {logLines.length === 0 && <div className="line">(no events yet)</div>}
+        <div className="right-pane">
+          {openedPath ? (
+            <FileDetailPanel
+              relativePath={openedPath}
+              currentProgress={cfp}
+              onClose={() => setOpenedPath("")}
+              onReevaluate={onReevaluateOne}
+              onEdited={refreshFiles}
+            />
+          ) : (
+            <div className="right-panel">
+              <h2>Activity log</h2>
+              <div className="log">
+                {logLines.map((l, i) => (
+                  <div className="line" key={i}>
+                    <span className="ts">{l.ts}</span>{l.text}
+                  </div>
+                ))}
+                {logLines.length === 0 && <div className="line">(no events yet)</div>}
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
     </div>
   );

@@ -20,6 +20,7 @@ from .schemas import (
     FileEditRequest,
     ReevaluateRequest,
     SetRepositoryRequest,
+    SkipDupSiblingsRequest,
     StartRequest,
 )
 
@@ -203,12 +204,16 @@ def api_files(
     search: str = "",
     limit: int = 1000,
     offset: int = 0,
+    sha256: str | None = None,
+    duplicates_only: bool = False,
 ):
     records = db.list_files(
         status=status if status else None,
         limit=max(1, min(5000, limit)),
         offset=max(0, offset),
         search=search,
+        sha256=sha256 if sha256 else None,
+        duplicates_only=duplicates_only,
     )
     out = []
     for r in records:
@@ -216,6 +221,7 @@ def api_files(
         e = d.pop("extraction", None) or {}
         ne = (e.get("named_entities") or {}) if e else {}
         d["title"] = e.get("title", "")
+        d["description"] = e.get("description", "")
         d["document_type"] = e.get("document_type", "")
         d["language"] = e.get("language", "")
         d["confidentiality"] = e.get("confidentiality", "")
@@ -238,6 +244,28 @@ def api_file(relative_path: str):
     if rec is None:
         raise HTTPException(404, f"Not found: {relative_path}")
     return rec.model_dump()
+
+
+@app.get("/api/file/dup-siblings")
+def api_file_dup_siblings(relative_path: str):
+    """Return all OTHER files with the same SHA-256 as this one (not this one)."""
+    sibs = db.list_dup_siblings(relative_path)
+    return {
+        "relative_path": relative_path,
+        "siblings": [s.model_dump() for s in sibs],
+        "count": len(sibs),
+    }
+
+
+@app.post("/api/files/skip-dup-siblings")
+def api_skip_dup_siblings(body: SkipDupSiblingsRequest):
+    """For every file in `relative_paths`, mark every OTHER file sharing the
+    same SHA-256 as 'skipped'. The given files themselves are NOT modified.
+    """
+    if not body.relative_paths:
+        raise HTTPException(400, "relative_paths is required")
+    n = db.skip_dup_siblings_of(body.relative_paths)
+    return {"updated": n}
 
 
 @app.get("/api/registry.xlsx")

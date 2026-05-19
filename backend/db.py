@@ -36,17 +36,22 @@ CREATE TABLE IF NOT EXISTS files (
     indexed_at TEXT,
     used_thinking INTEGER NOT NULL DEFAULT 0,
     extraction_json TEXT,
-    manually_edited INTEGER NOT NULL DEFAULT 0
+    manually_edited INTEGER NOT NULL DEFAULT 0,
+    is_duplicate INTEGER NOT NULL DEFAULT 0,
+    duplicate_group TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
+CREATE INDEX IF NOT EXISTS idx_files_dup ON files(is_duplicate);
 """
 
 # Columns added in later schema versions; we ensure they exist via ALTER TABLE
 # at startup (safe to repeat — we check first).
 _LATER_COLUMNS = [
     ("manually_edited", "INTEGER NOT NULL DEFAULT 0"),
+    ("is_duplicate", "INTEGER NOT NULL DEFAULT 0"),
+    ("duplicate_group", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -421,6 +426,8 @@ class Database:
         limit: int = 5000,
         offset: int = 0,
         search: str = "",
+        sha256: Optional[str] = None,
+        duplicates_only: bool = False,
     ) -> list[FileRecord]:
         sql = "SELECT * FROM files"
         clauses = []
@@ -432,6 +439,11 @@ class Database:
             clauses.append("(relative_path LIKE ? OR file_name LIKE ?)")
             like = f"%{search}%"
             params.extend([like, like])
+        if sha256:
+            clauses.append("sha256=?")
+            params.append(sha256)
+        if duplicates_only:
+            clauses.append("is_duplicate=1")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY relative_path LIMIT ? OFFSET ?"
@@ -439,6 +451,80 @@ class Database:
         with self.conn() as c:
             rows = c.execute(sql, params).fetchall()
             return [_row_to_record(r) for r in rows]
+
+    def list_dup_siblings(self, relative_path: str) -> list[FileRecord]:
+        """Return all OTHER files that share the same SHA-256 as this one."""
+        with self.conn() as c:
+            cur = c.execute(
+                "SELECT sha256 FROM files WHERE relative_path=?", (relative_path,)
+            ).fetchone()
+            if cur is None:
+                return []
+            sha = cur["sha256"]
+            rows = c.execute(
+                "SELECT * FROM files WHERE sha256=? AND relative_path<>? "
+                "ORDER BY relative_path",
+                (sha, relative_path),
+            ).fetchall()
+            return [_row_to_record(r) for r in rows]
+
+    def recompute_duplicates(self) -> int:
+        """One-pass authoritative recompute of is_duplicate / duplicate_group
+        for every row. Returns the number of duplicate groups (size >= 2).
+        """
+        with self.conn() as c:
+            c.execute("""
+                UPDATE files
+                   SET is_duplicate = 0,
+                       duplicate_group = ''
+            """)
+            c.execute("""
+                UPDATE files
+                   SET is_duplicate = 1,
+                       duplicate_group = sha256
+                 WHERE sha256 IN (
+                    SELECT sha256 FROM files
+                    GROUP BY sha256
+                    HAVING COUNT(*) >= 2
+                 )
+            """)
+            row = c.execute("""
+                SELECT COUNT(*) AS n FROM (
+                    SELECT 1 FROM files
+                    GROUP BY sha256
+                    HAVING COUNT(*) >= 2
+                )
+            """).fetchone()
+            return int(row["n"]) if row else 0
+
+    def skip_dup_siblings_of(self, relative_paths: Iterable[str]) -> int:
+        """For every SHA-256 in the given selection, mark every OTHER file
+        with the same SHA-256 as 'skipped'. The selected files themselves
+        are NOT touched. Returns number of rows updated.
+        """
+        with self.conn() as c:
+            shas = set()
+            for p in relative_paths:
+                row = c.execute(
+                    "SELECT sha256 FROM files WHERE relative_path=?", (p,)
+                ).fetchone()
+                if row and row["sha256"]:
+                    shas.add(row["sha256"])
+            if not shas:
+                return 0
+            placeholders = ",".join("?" for _ in relative_paths)
+            sha_placeholders = ",".join("?" for _ in shas)
+            params: list[Any] = []
+            params.extend(shas)
+            params.extend(relative_paths)
+            cur = c.execute(
+                f"""UPDATE files
+                       SET status='skipped', manually_edited=1
+                     WHERE sha256 IN ({sha_placeholders})
+                       AND relative_path NOT IN ({placeholders})""",
+                params,
+            )
+            return cur.rowcount
 
     def list_all_for_excel(self) -> list[FileRecord]:
         with self.conn() as c:
@@ -485,10 +571,17 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
             extraction = LLMExtraction(named_entities=ne, **data)
         except Exception:
             extraction = None
-    try:
-        manually_edited = bool(row["manually_edited"])
-    except (KeyError, IndexError):
-        manually_edited = False
+
+    def _opt(name: str, default: Any = None) -> Any:
+        try:
+            return row[name]
+        except (KeyError, IndexError):
+            return default
+
+    manually_edited = bool(_opt("manually_edited", 0))
+    is_duplicate = bool(_opt("is_duplicate", 0))
+    duplicate_group = _opt("duplicate_group", "") or ""
+
     return FileRecord(
         relative_path=row["relative_path"],
         file_name=row["file_name"],
@@ -504,4 +597,6 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         extraction=extraction,
         used_thinking=bool(row["used_thinking"]),
         manually_edited=manually_edited,
+        is_duplicate=is_duplicate,
+        duplicate_group=duplicate_group,
     )

@@ -40,6 +40,7 @@ You will be given:
 Schema (every field MUST be present, use empty string/list/0 if unknown):
 {
   "title":               string,
+  "description":         string,
   "summary":             string,
   "document_date":       string,
   "last_update_date":    string,
@@ -65,6 +66,9 @@ Schema (every field MUST be present, use empty string/list/0 if unknown):
 
 Field rules:
   - "title": Best document title; if missing, derive from filename.
+  - "description": ONE concise sentence (120-250 chars max), describing what the
+        document IS and what it covers. Distinct from "summary": this is a
+        compact tagline, not a detailed summary. NEVER exceed 250 characters.
   - "summary": 1500-2500 chars when content allows, factual, neutral, no marketing fluff.
   - "document_date" / "last_update_date": "YYYY-MM-DD" if a full date is known,
         else "YYYY-MM" if only month/year is known, else "YYYY", else "".
@@ -329,6 +333,8 @@ class LMClient:
         # Defensive cleanup
         if isinstance(data.get("summary"), str) and len(data["summary"]) > 2500:
             data["summary"] = data["summary"][:2500]
+        if isinstance(data.get("description"), str) and len(data["description"]) > 250:
+            data["description"] = data["description"][:250]
         kp = data.get("key_phrases")
         if isinstance(kp, list) and len(kp) > 10:
             data["key_phrases"] = kp[:10]
@@ -354,7 +360,8 @@ class LMClient:
 
         # Coerce string-like fields (use empty string for missing/None)
         str_fields = [
-            "title", "summary", "document_date", "last_update_date",
+            "title", "description", "summary",
+            "document_date", "last_update_date",
             "document_type", "language", "version", "confidentiality",
             "geographic_scope", "industry_domain",
         ]

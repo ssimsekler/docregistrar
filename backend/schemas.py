@@ -27,6 +27,7 @@ MAX_CUSTOM_PROPERTIES = 50
 
 class LLMExtraction(BaseModel):
     title: str = ""
+    description: str = ""                   # up to 250 chars - one-line gist of the file
     summary: str = ""                       # up to 2500 chars
     document_date: str = ""                 # ISO YYYY-MM-DD if known, else YYYY-MM, else YYYY, else ""
     last_update_date: str = ""              # same format as above
@@ -66,6 +67,8 @@ class FileRecord(BaseModel):
     extraction: Optional[LLMExtraction] = None
     used_thinking: bool = False
     manually_edited: bool = False           # True if user has edited any field; protects from auto re-eval
+    is_duplicate: bool = False              # True iff another file in the registry has the same SHA-256
+    duplicate_group: str = ""               # SHA-256 string shared by all duplicates of this content
 
 
 # -------- API DTOs --------
@@ -95,6 +98,7 @@ class FileEditRequest(BaseModel):
     repository: Optional[str] = None
     # LLM-style fields (any may be edited)
     title: Optional[str] = None
+    description: Optional[str] = None
     summary: Optional[str] = None
     document_date: Optional[str] = None
     last_update_date: Optional[str] = None
@@ -121,6 +125,12 @@ class BulkEditRequest(BaseModel):
     relative_paths: list[str]
     repository: Optional[str] = None
     status: Optional[FileStatus] = None
+
+
+class SkipDupSiblingsRequest(BaseModel):
+    """Mark every other file sharing the same SHA-256 as the given files
+    as 'skipped'. The given files themselves are NOT modified."""
+    relative_paths: list[str]
 
 
 class FileStep(BaseModel):
