@@ -20,7 +20,7 @@ class LLMConfig(BaseModel):
     thinking_default: bool = False
     thinking_on_low_quality: bool = True
     low_quality_threshold: float = 0.6
-    max_output_tokens: int = 2048
+    max_output_tokens: int = 4096
 
 
 class ExtractConfig(BaseModel):

@@ -13,7 +13,16 @@ from . import ExtractionResult
 def extract_docx(path: Path) -> ExtractionResult:
     from docx import Document
 
-    doc = Document(str(path))
+    try:
+        doc = Document(str(path))
+    except (KeyError, Exception) as e:
+        # Some DOCX files have corrupt internal structures (e.g., missing
+        # 'word/#TOC' entries). Return a clean error rather than crashing.
+        return ExtractionResult(
+            text=f"[Could not open DOCX: {type(e).__name__}: {e}]",
+            page_count=None,
+            extraction_error=f"docx_open_failed: {type(e).__name__}: {e}",
+        )
 
     parts: list[str] = []
 

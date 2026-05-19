@@ -23,8 +23,9 @@ llm:
   thinking_default: false       # Fast first pass.
   thinking_on_low_quality: true # Re-run with thinking ON if quality_score < threshold.
   low_quality_threshold: 0.6
-  # Output token cap (per LLM call)
-  max_output_tokens: 2048
+  # Output token cap (per LLM call). Must be large enough for reasoning + JSON.
+  # 4096 works well with 8192 context length in LM Studio.
+  max_output_tokens: 4096
 
 # Text-extraction limits sent to the LLM (characters, not tokens).
 # Strategy: head + middle + tail of the document concatenated.
