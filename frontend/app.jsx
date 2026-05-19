@@ -746,11 +746,13 @@ function App() {
   };
 
   const runElapsed = useMemo(() => {
+    // Only show elapsed when actively running (not idle/error)
     if (!progress.started_at) return "";
+    if (progress.state === "idle" || progress.state === "error") return "";
     const t0 = new Date(progress.started_at).getTime();
     return fmtMs(Date.now() - t0);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress.started_at, tick]);
+  }, [progress.started_at, progress.state, tick]);
 
   const pct = progress.total > 0 ? Math.round(((progress.done + progress.error) / progress.total) * 100) : 0;
   const running = ["scanning", "running", "paused", "stopping"].includes(progress.state);
@@ -893,6 +895,11 @@ function App() {
                 {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
               <button className="primary" onClick={onBulkApply}>Apply</button>
+              <button onClick={onSkipDupSiblings}
+                      title="Mark every OTHER file with the same SHA-256 as the selected files as 'skipped'. Selected files themselves stay unchanged."
+                      disabled={selected.size === 0}>
+                Skip dup siblings
+              </button>
               <div className="spacer"></div>
               <button onClick={() => setSelected(new Set())}>Clear selection</button>
             </div>
@@ -907,44 +914,50 @@ function App() {
                       checked={selected.size > 0 && selected.size === files.length}
                       onChange={e => toggleSelAll(e.target.checked)} />
                   </th>
-                  <th>Status</th>
-                  <th>Q</th>
-                  <th>File</th>
-                  <th>Path</th>
+                  <th title="File processing status. Hover to see error.">Status</th>
+                  <th title="Quality score (0–1)">Q</th>
+                  <th title="Duplicate marker">Dup</th>
                   <th>Repository</th>
+                  <th title="Click file name to open the file in your OS default app">File</th>
+                  <th>Path</th>
                   <th>Type</th>
                   <th>Title</th>
                   <th>Date</th>
                   <th>Conf.</th>
                   <th>Size</th>
-                  <th>Pages</th>
-                  <th>Edit</th>
-                  <th>Error</th>
+                  <th title="Manually edited marker">✎</th>
+                  <th title="Click to filter table by this SHA-256">SHA-256</th>
                 </tr>
               </thead>
               <tbody>
                 {files.map(f => (
                   <tr key={f.relative_path}
-                      className={`${selected.has(f.relative_path) ? "selected" : ""} ${openedPath === f.relative_path ? "opened" : ""}`}
+                      className={`${selected.has(f.relative_path) ? "selected" : ""} ${openedPath === f.relative_path ? "opened" : ""} ${f.is_duplicate ? "dup-row" : ""}`}
                       onClick={() => setOpenedPath(f.relative_path)}>
                     <td onClick={e => e.stopPropagation()}>
                       <input type="checkbox" className="checkbox"
                         checked={selected.has(f.relative_path)}
                         onChange={() => toggleSel(f.relative_path)} />
                     </td>
-                    <td className={`status-cell status-${f.status}`}>{f.status}</td>
+                    <td className={`status-cell status-${f.status}`}
+                        title={f.error ? `Error: ${f.error}` : f.status}>{f.status}</td>
                     <td>{f.quality_score !== "" && f.quality_score != null ? Number(f.quality_score).toFixed(2) : ""}</td>
-                    <td className="truncate" title={f.file_name}>{f.file_name}</td>
-                    <td className="truncate" title={f.relative_path}>{f.relative_path}</td>
+                    <td className="dup-cell" title={f.is_duplicate ? "This file has duplicates (same SHA-256)" : ""}>{f.is_duplicate ? "🟰" : ""}</td>
                     <td className="truncate" title={f.repository}>{f.repository || ""}</td>
+                    <td className="truncate" title={`Click to open: ${f.file_name}`}
+                        onClick={e => { e.stopPropagation(); /* TODO: open file via backend */ setOpenedPath(f.relative_path); }}
+                        style={{ color: "var(--accent-2)", cursor: "pointer" }}>{f.file_name}</td>
+                    <td className="truncate" title={f.relative_path}>{f.relative_path}</td>
                     <td>{f.document_type || f.extension}</td>
                     <td className="truncate" title={f.title}>{f.title}</td>
                     <td>{f.document_date}</td>
                     <td>{f.confidentiality}</td>
                     <td>{fmtBytes(f.file_size)}</td>
-                    <td>{f.page_count ?? ""}</td>
                     <td>{f.manually_edited ? "✎" : ""}</td>
-                    <td className="error-text truncate" title={f.error}>{f.error}</td>
+                    <td className="sha-cell" title={`SHA-256: ${f.sha256}\nClick to filter by this hash`}
+                        onClick={e => { e.stopPropagation(); setShaFilter(f.sha256); }}>
+                      {f.sha256 ? f.sha256.slice(0, 8) + "…" : ""}
+                    </td>
                   </tr>
                 ))}
                 {files.length === 0 && (
@@ -969,6 +982,7 @@ function App() {
               onClose={() => setOpenedPath("")}
               onReevaluate={onReevaluateOne}
               onEdited={refreshFiles}
+              onOpenSibling={path => setOpenedPath(path)}
             />
           ) : (
             <div className="right-panel">
