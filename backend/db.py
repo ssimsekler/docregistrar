@@ -51,6 +51,8 @@ _LATER_COLUMNS = [
     ("manually_edited", "INTEGER NOT NULL DEFAULT 0"),
     ("is_duplicate", "INTEGER NOT NULL DEFAULT 0"),
     ("duplicate_group", "TEXT NOT NULL DEFAULT ''"),
+    ("indexing_started_at", "TEXT"),
+    ("indexing_completed_at", "TEXT"),
 ]
 
 
@@ -159,10 +161,19 @@ class Database:
 
     def mark_status(self, relative_path: str, status: str, error: str = "") -> None:
         with self.conn() as c:
-            c.execute(
-                "UPDATE files SET status=?, error=? WHERE relative_path=?",
-                (status, error, relative_path),
-            )
+            if status == "processing":
+                # Record when indexing started (with timezone)
+                from datetime import datetime, timezone
+                started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                c.execute(
+                    "UPDATE files SET status=?, error=?, indexing_started_at=? WHERE relative_path=?",
+                    (status, error, started, relative_path),
+                )
+            else:
+                c.execute(
+                    "UPDATE files SET status=?, error=? WHERE relative_path=?",
+                    (status, error, relative_path),
+                )
 
     def reset_to_pending(self, relative_paths: Iterable[str], *, force: bool = False) -> tuple[int, int]:
         """Set rows back to 'pending' so they get re-processed.
@@ -239,17 +250,21 @@ class Database:
         if prev_custom and not extraction.custom_properties:
             extraction = extraction.model_copy(update={"custom_properties": prev_custom})
 
+        from datetime import datetime, timezone
+        completed = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
         with self.conn() as c:
             c.execute(
                 """UPDATE files
                       SET page_count=?, extraction_json=?, status='done', error='',
-                          indexed_at=?, used_thinking=?
+                          indexed_at=?, used_thinking=?, indexing_completed_at=?
                     WHERE relative_path=?""",
                 (
                     page_count,
                     extraction.model_dump_json(),
                     now_iso(),
                     1 if used_thinking else 0,
+                    completed,
                     relative_path,
                 ),
             )
@@ -595,6 +610,8 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         status=row["status"],
         error=row["error"] or "",
         indexed_at=row["indexed_at"],
+        indexing_started_at=_opt("indexing_started_at"),
+        indexing_completed_at=_opt("indexing_completed_at"),
         extraction=extraction,
         used_thinking=bool(row["used_thinking"]),
         manually_edited=manually_edited,

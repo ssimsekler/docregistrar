@@ -44,6 +44,9 @@ class LLMExtraction(BaseModel):
     industry_domain: str = ""
     quality_score: float = 0.0              # 0..1, model self-rated
     repository: str = ""                    # user-assigned, NOT extracted by the LLM
+    source_url_1: str = ""                  # user-assigned URL references (not extracted by LLM)
+    source_url_2: str = ""
+    source_url_3: str = ""
     custom_properties: list[KVPair] = Field(default_factory=list)  # user-defined K/V pairs
 
 
@@ -64,6 +67,8 @@ class FileRecord(BaseModel):
     status: FileStatus = "pending"
     error: str = ""
     indexed_at: Optional[str] = None
+    indexing_started_at: Optional[str] = None   # ISO datetime with TZ when processing began
+    indexing_completed_at: Optional[str] = None  # ISO datetime with TZ when processing finished
     extraction: Optional[LLMExtraction] = None
     used_thinking: bool = False
     manually_edited: bool = False           # True if user has edited any field; protects from auto re-eval
@@ -96,6 +101,9 @@ class FileEditRequest(BaseModel):
     error: Optional[str] = None
     # User-managed
     repository: Optional[str] = None
+    source_url_1: Optional[str] = None
+    source_url_2: Optional[str] = None
+    source_url_3: Optional[str] = None
     # LLM-style fields (any may be edited)
     title: Optional[str] = None
     description: Optional[str] = None
