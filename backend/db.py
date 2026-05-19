@@ -43,7 +43,6 @@ CREATE TABLE IF NOT EXISTS files (
 
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
-CREATE INDEX IF NOT EXISTS idx_files_dup ON files(is_duplicate);
 """
 
 # Columns added in later schema versions; we ensure they exist via ALTER TABLE
@@ -78,6 +77,8 @@ class Database:
             for col_name, col_def in _LATER_COLUMNS:
                 if col_name not in existing_cols:
                     conn.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_def}")
+            # Create indexes that depend on migrated columns (safe to repeat)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_files_dup ON files(is_duplicate)")
             cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
             row = cur.fetchone()
             if row is None:
