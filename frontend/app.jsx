@@ -41,6 +41,9 @@ const STRING_FIELDS = [
   ["geographic_scope", "Geographic scope"],
   ["industry_domain", "Industry domain"],
   ["repository", "Repository"],
+  ["source_url_1", "Source URL 1"],
+  ["source_url_2", "Source URL 2"],
+  ["source_url_3", "Source URL 3"],
 ];
 const DESCRIPTION_MAX = 250;
 const LIST_FIELDS = [
@@ -139,6 +142,9 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
         geographic_scope: e.geographic_scope || "",
         industry_domain: e.industry_domain || "",
         repository: e.repository || "",
+        source_url_1: e.source_url_1 || "",
+        source_url_2: e.source_url_2 || "",
+        source_url_3: e.source_url_3 || "",
         quality_score: e.quality_score ?? "",
         authors: listToString(e.authors),
         key_concepts: listToString(e.key_concepts),
@@ -345,6 +351,8 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             <PropRow label="OS created" value={rec.os_created} />
             <PropRow label="OS modified" value={rec.os_modified} />
             <PropRow label="Indexed at" value={rec.indexed_at} />
+            <PropRow label="Indexing started" value={rec.indexing_started_at} />
+            <PropRow label="Indexing completed" value={rec.indexing_completed_at} />
             <PropRow label="Used thinking" value={rec.used_thinking ? "Yes" : "No"} />
             <PropRow label="Manually edited" value={rec.manually_edited ? "Yes" : "No"} />
             <PropRow label="Is duplicate" value={rec.is_duplicate ? "Yes" : "No"} />
@@ -945,7 +953,15 @@ function App() {
                     <td className="dup-cell" title={f.is_duplicate ? "This file has duplicates (same SHA-256)" : ""}>{f.is_duplicate ? "🟰" : ""}</td>
                     <td className="truncate" title={f.repository}>{f.repository || ""}</td>
                     <td className="truncate" title={`Click to open: ${f.file_name}`}
-                        onClick={e => { e.stopPropagation(); /* TODO: open file via backend */ setOpenedPath(f.relative_path); }}
+                        onClick={async e => {
+                          e.stopPropagation();
+                          setOpenedPath(f.relative_path);
+                          try {
+                            await api("POST", "/api/open-file", { relative_path: f.relative_path });
+                          } catch (err) {
+                            alert(`Could not open file:\n${err.message}`);
+                          }
+                        }}
                         style={{ color: "var(--accent-2)", cursor: "pointer" }}>{f.file_name}</td>
                     <td className="truncate" title={f.relative_path}>{f.relative_path}</td>
                     <td>{f.document_type || f.extension}</td>

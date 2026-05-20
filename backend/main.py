@@ -4,12 +4,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from .config import PROJECT_ROOT, load_config
 from .db import Database
@@ -23,6 +26,19 @@ from .schemas import (
     SkipDupSiblingsRequest,
     StartRequest,
 )
+
+# Extensions blocked by POST /api/open-file. Everything else is allowed,
+# including macro-enabled Office files (.xlsm, .docm, .pptm, .xlsb), which
+# are documents (the host app prompts before running macros).
+BLOCKED_OPEN_EXTENSIONS = {
+    ".exe", ".bat", ".cmd", ".com", ".msi", ".scr",
+    ".ps1", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".wsh", ".pif", ".lnk",
+}
+
+
+class OpenFileRequest(BaseModel):
+    relative_path: str
 
 logging.basicConfig(
     level=logging.INFO,
@@ -280,6 +296,60 @@ def api_registry_download():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.post("/api/open-file")
+def api_open_file(req: OpenFileRequest):
+    """Open a file from the registry in the OS default app.
+
+    Safety:
+      - Only files inside the active target_folder may be opened (no path
+        traversal).
+      - Extensions in BLOCKED_OPEN_EXTENSIONS (executables / scripts) are
+        refused with HTTP 403.
+      - Macro-enabled Office files (.xlsm, .docm, .pptm, .xlsb) are allowed:
+        they are documents, and the host app shows its own macro warning.
+    """
+    rel = (req.relative_path or "").strip()
+    if not rel:
+        raise HTTPException(400, "relative_path is required")
+
+    target_folder = job.snapshot().target_folder
+    if not target_folder:
+        raise HTTPException(400, "No active target folder")
+
+    try:
+        base = Path(target_folder).resolve()
+        full = (base / rel).resolve()
+        # Ensure the resolved file is inside the target folder
+        full.relative_to(base)
+    except (ValueError, OSError):
+        raise HTTPException(400, "Invalid path")
+
+    if not full.exists() or not full.is_file():
+        raise HTTPException(404, f"File not found: {rel}")
+
+    ext = full.suffix.lower()
+    if ext in BLOCKED_OPEN_EXTENSIONS:
+        raise HTTPException(
+            403,
+            f"Refusing to open '{ext}' files for safety. "
+            f"Blocked: {', '.join(sorted(BLOCKED_OPEN_EXTENSIONS))}",
+        )
+
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(full))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", str(full)])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(full)])
+    except Exception as e:
+        raise HTTPException(500, f"Failed to open file: {e}")
+
+    return {"ok": True, "opened": rel}
 
 
 # -------- WebSocket --------
