@@ -287,6 +287,17 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                               title="Save edits and exit edit mode">💾 Save</button>}
           {editing && <button onClick={() => { setEditing(false); load(); }}
                               title="Discard edits and reload the saved values">Cancel</button>}
+          {!editing && <button
+              onClick={async () => {
+                try {
+                  await api("POST", "/api/open-file-location", { relative_path: relativePath });
+                } catch (err) {
+                  alert(`Could not open file location:\n${err.message}`);
+                }
+              }}
+              title="Open the OS file explorer at this file's folder (file will be highlighted on Windows/macOS)">
+            📁 Open location
+          </button>}
           {!editing && <button onClick={() => onReevaluate(relativePath, false)}
                                title="Queue this file for re-evaluation by the LLM (skipped if manually edited)">↻ Re-eval</button>}
           {!editing && <button onClick={() => onReevaluate(relativePath, true)}
@@ -344,6 +355,7 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               <PropRow label="Status" value={rec.status} />
             )}
             <PropRow label="Error" value={rec.error} />
+            <PropRow label="Full path" value={rec.full_path} />
             <PropRow label="Size" value={fmtBytes(rec.file_size)} />
             <PropRow label="Pages / slides" value={rec.page_count} />
             <PropRow label="Extension" value={rec.extension} />
@@ -683,6 +695,9 @@ function App() {
       if (r.skipped_manual) {
         msg += `\n${r.skipped_manual} manually-edited file(s) were SKIPPED. Use the "Force" button to override.`;
       }
+      if (r.skipped_status) {
+        msg += `\n${r.skipped_status} file(s) in 'skipped' status were NOT re-evaluated. Set their status to 'pending' first.`;
+      }
       alert(msg);
       setSelected(new Set());
       refreshFiles();
@@ -693,7 +708,11 @@ function App() {
     if (!confirm("Force re-evaluate WILL discard manual edits on the selected files. Continue?")) return;
     const r = await reevaluatePaths(Array.from(selected), useThinking, true);
     if (r) {
-      alert(`Queued ${r.reset} file(s) for re-evaluation (force).`);
+      let msg = `Queued ${r.reset} file(s) for re-evaluation (force).`;
+      if (r.skipped_status) {
+        msg += `\n${r.skipped_status} file(s) in 'skipped' status were NOT re-evaluated. Set their status to 'pending' first (Force does not override Skipped).`;
+      }
+      alert(msg);
       setSelected(new Set());
       refreshFiles();
     }
@@ -701,7 +720,9 @@ function App() {
   const onReevaluateOne = async (path, withThinking) => {
     const r = await reevaluatePaths([path], withThinking, false);
     if (r) {
-      if (r.skipped_manual) {
+      if (r.skipped_status) {
+        alert("This file is in 'skipped' status and cannot be re-evaluated.\n\nSet its status to 'pending' first (e.g. via the Edit panel) to re-evaluate.");
+      } else if (r.skipped_manual) {
         if (confirm("This file is manually edited and was skipped. Force re-evaluate (discards edits)?")) {
           await reevaluatePaths([path], withThinking, true);
         }

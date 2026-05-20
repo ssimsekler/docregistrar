@@ -53,6 +53,7 @@ _LATER_COLUMNS = [
     ("duplicate_group", "TEXT NOT NULL DEFAULT ''"),
     ("indexing_started_at", "TEXT"),
     ("indexing_completed_at", "TEXT"),
+    ("full_path", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -125,6 +126,7 @@ class Database:
         sha256: str,
         os_created: Optional[str],
         os_modified: Optional[str],
+        full_path: str = "",
     ) -> str:
         """Insert a new pending row, or update size/sha/dates if file changed.
 
@@ -132,16 +134,16 @@ class Database:
         """
         with self.conn() as c:
             row = c.execute(
-                "SELECT sha256, status FROM files WHERE relative_path=?",
+                "SELECT sha256, status, full_path FROM files WHERE relative_path=?",
                 (relative_path,),
             ).fetchone()
             if row is None:
                 c.execute(
                     """INSERT INTO files(relative_path, file_name, extension, file_size,
-                                         sha256, os_created, os_modified, status)
-                       VALUES(?,?,?,?,?,?,?, 'pending')""",
+                                         sha256, os_created, os_modified, status, full_path)
+                       VALUES(?,?,?,?,?,?,?, 'pending', ?)""",
                     (relative_path, file_name, extension, file_size,
-                     sha256, os_created, os_modified),
+                     sha256, os_created, os_modified, full_path),
                 )
                 return "pending"
 
@@ -149,14 +151,21 @@ class Database:
                 # File changed → reset to pending
                 c.execute(
                     """UPDATE files SET file_size=?, sha256=?, os_created=?, os_modified=?,
+                                        full_path=?,
                                         status='pending', error='', extraction_json=NULL,
                                         indexed_at=NULL, used_thinking=0
                        WHERE relative_path=?""",
-                    (file_size, sha256, os_created, os_modified, relative_path),
+                    (file_size, sha256, os_created, os_modified, full_path, relative_path),
                 )
                 return "pending"
 
-            # Unchanged
+            # Unchanged content. Refresh full_path if it's empty or differs
+            # (the user may have moved the registry to a new mount point).
+            if full_path and (row["full_path"] or "") != full_path:
+                c.execute(
+                    "UPDATE files SET full_path=? WHERE relative_path=?",
+                    (full_path, relative_path),
+                )
             return row["status"]
 
     def mark_status(self, relative_path: str, status: str, error: str = "") -> None:
@@ -175,20 +184,35 @@ class Database:
                     (status, error, relative_path),
                 )
 
-    def reset_to_pending(self, relative_paths: Iterable[str], *, force: bool = False) -> tuple[int, int]:
+    def reset_to_pending(self, relative_paths: Iterable[str], *, force: bool = False) -> tuple[int, int, int]:
         """Set rows back to 'pending' so they get re-processed.
 
         If `force=False`, rows with manually_edited=1 are SKIPPED.
-        Returns (n_reset, n_skipped_due_to_manual_edit).
+        Rows whose current status is 'skipped' are ALWAYS refused (even with
+        force=True). Their `error` field is set to a hint telling the user to
+        flip the status to 'pending' explicitly first.
+
+        Returns (n_reset, n_skipped_due_to_manual_edit, n_skipped_status_skipped).
         """
         n_reset = 0
         n_skipped = 0
+        n_skipped_status = 0
+        skip_msg = ("File is in 'skipped' status and cannot be re-evaluated. "
+                    "Set its status to 'pending' first to re-evaluate.")
         with self.conn() as c:
             for p in relative_paths:
                 row = c.execute(
-                    "SELECT manually_edited FROM files WHERE relative_path=?", (p,)
+                    "SELECT manually_edited, status FROM files WHERE relative_path=?", (p,)
                 ).fetchone()
                 if row is None:
+                    continue
+                if row["status"] == "skipped":
+                    # Never auto-flip a skipped file. Record the reason in error.
+                    c.execute(
+                        "UPDATE files SET error=? WHERE relative_path=?",
+                        (skip_msg, p),
+                    )
+                    n_skipped_status += 1
                     continue
                 if not force and row["manually_edited"]:
                     n_skipped += 1
@@ -201,7 +225,7 @@ class Database:
                     (p,),
                 )
                 n_reset += cur.rowcount
-        return n_reset, n_skipped
+        return n_reset, n_skipped, n_skipped_status
 
     def reset_in_progress_to_pending(self) -> int:
         with self.conn() as c:
@@ -421,12 +445,111 @@ class Database:
         return n
 
     def next_pending(self) -> Optional[FileRecord]:
+        """Return the next file the worker should process.
+
+        Priority:
+          1. status='pending' rows (newest scan / explicit re-eval)
+          2. then status='error' rows (so transient failures get re-tried
+             once the pending queue is drained — items 5 in the spec)
+        Files in 'skipped' status are NEVER returned (item 5).
+        Files in 'done' or 'processing' are obviously not eligible either.
+        """
         with self.conn() as c:
+            # First: pending
             row = c.execute(
                 "SELECT * FROM files WHERE status='pending' "
                 "ORDER BY relative_path LIMIT 1"
             ).fetchone()
+            if row is not None:
+                return _row_to_record(row)
+            # Then: error rows
+            row = c.execute(
+                "SELECT * FROM files WHERE status='error' "
+                "ORDER BY relative_path LIMIT 1"
+            ).fetchone()
             return _row_to_record(row) if row else None
+
+    def find_done_sibling(self, sha256: str, exclude_relative_path: str) -> Optional[FileRecord]:
+        """Return any other file with the same SHA-256 that's already 'done'.
+
+        Used to short-circuit LLM extraction when a byte-identical sibling
+        was already processed (item 1).
+        """
+        if not sha256:
+            return None
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT * FROM files WHERE sha256=? AND relative_path<>? "
+                "AND status='done' AND extraction_json IS NOT NULL "
+                "ORDER BY relative_path LIMIT 1",
+                (sha256, exclude_relative_path),
+            ).fetchone()
+            return _row_to_record(row) if row else None
+
+    def copy_extraction_from_sibling(
+        self,
+        target_relative_path: str,
+        source_relative_path: str,
+        *,
+        default_repository: str = "",
+    ) -> bool:
+        """Copy `extraction_json` and `page_count` from one row to another.
+
+        Sets target's status='done', clears error, fills indexed_at and
+        indexing_started_at/indexing_completed_at to 'now', leaves
+        manually_edited=0 and used_thinking=0. The target keeps its own
+        relative_path / file_name / sha256 / etc.
+
+        If `default_repository` is non-empty AND the copied extraction has
+        no repository set, the default is filled in.
+
+        Returns True on success.
+        """
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        with self.conn() as c:
+            src = c.execute(
+                "SELECT extraction_json, page_count FROM files WHERE relative_path=?",
+                (source_relative_path,),
+            ).fetchone()
+            if src is None or not src["extraction_json"]:
+                return False
+
+            ext_data: dict
+            try:
+                ext_data = json.loads(src["extraction_json"])
+            except Exception:
+                return False
+
+            if default_repository and not (ext_data.get("repository") or ""):
+                ext_data["repository"] = default_repository
+
+            # Re-validate via Pydantic to keep a consistent shape
+            try:
+                ne_obj = NamedEntities(**(ext_data.pop("named_entities", {}) or {}))
+                extraction = LLMExtraction(named_entities=ne_obj, **ext_data)
+                ext_json = extraction.model_dump_json()
+            except Exception:
+                # Fall back to raw JSON if validation fails
+                ext_json = src["extraction_json"]
+
+            cur = c.execute(
+                """UPDATE files
+                      SET extraction_json=?, page_count=?, status='done', error='',
+                          indexed_at=?, indexing_started_at=?, indexing_completed_at=?,
+                          used_thinking=0, manually_edited=0
+                    WHERE relative_path=?""",
+                (
+                    ext_json,
+                    src["page_count"],
+                    now_iso(),
+                    ts,
+                    ts,
+                    target_relative_path,
+                ),
+            )
+            return cur.rowcount > 0
 
     def get_file(self, relative_path: str) -> Optional[FileRecord]:
         with self.conn() as c:
@@ -600,6 +723,7 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
 
     return FileRecord(
         relative_path=row["relative_path"],
+        full_path=_opt("full_path", "") or "",
         file_name=row["file_name"],
         extension=row["extension"],
         file_size=int(row["file_size"]),

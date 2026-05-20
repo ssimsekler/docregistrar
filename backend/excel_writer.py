@@ -25,6 +25,7 @@ SHEET_NAME = "Documents"
 COLUMNS: list[tuple[str, int]] = [
     ("File name", 30),
     ("Relative path", 50),
+    ("Full path", 60),
     ("Repository", 18),
     ("File size (bytes)", 14),
     ("SHA-256", 36),
@@ -103,6 +104,7 @@ def _record_to_row(rec: FileRecord) -> list:
     return [
         rec.file_name,
         rec.relative_path,
+        rec.full_path or "",
         (e.repository if e else ""),
         rec.file_size,
         rec.sha256,

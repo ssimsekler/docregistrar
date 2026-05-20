@@ -17,7 +17,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .config import AppConfig, normalize_extensions
+from .config import (
+    ALLOWED_DOC_OR_IMAGE_EXTENSIONS,
+    AppConfig,
+    normalize_extensions,
+)
 from .db import Database
 from .excel_writer import write_registry
 from .extractors import extract_any, truncate_head_middle_tail
@@ -57,6 +61,10 @@ class _State:
     thinking_overrides: dict[str, bool] = field(default_factory=dict)
     # Per-file fine-grained progress
     current_file_progress: Optional[_CurrentFile] = None
+    # Set of relative_paths the user asked to skip while they are/were
+    # being processed. The worker checks this set between major steps and
+    # cleanly aborts the current file (item 7).
+    skip_signals: set[str] = field(default_factory=set)
 
 
 class JobManager:
@@ -220,13 +228,18 @@ class JobManager:
             t.join(timeout=timeout)
 
     def reevaluate(self, relative_paths: list[str], use_thinking: bool = False,
-                   force: bool = False) -> tuple[int, int]:
+                   force: bool = False) -> tuple[int, int, int]:
         """Reset the given files to 'pending' (will be picked up on next scan loop).
 
-        Returns (n_reset, n_skipped_due_to_manual_edit).
-        Edited rows are skipped unless `force=True`.
+        Returns (n_reset, n_skipped_due_to_manual_edit, n_skipped_status_skipped).
+        - Manually-edited rows are skipped unless `force=True`.
+        - Rows currently in 'skipped' status are ALWAYS refused (item 5);
+          their `error` field is set to a hint instructing the user to
+          flip the status to 'pending' first.
         """
-        n_reset, n_skipped = self.db.reset_to_pending(relative_paths, force=force)
+        n_reset, n_skipped, n_skipped_status = self.db.reset_to_pending(
+            relative_paths, force=force,
+        )
         if use_thinking:
             with self._lock:
                 for p in relative_paths:
@@ -234,14 +247,47 @@ class JobManager:
         msg = f"Queued {n_reset} file(s) for re-evaluation (thinking={use_thinking})"
         if n_skipped:
             msg += f"; skipped {n_skipped} manually-edited file(s) (use Force to override)"
+        if n_skipped_status:
+            msg += (f"; refused {n_skipped_status} file(s) in 'skipped' status "
+                    f"(set their status to 'pending' first)")
         self._set_message(msg + ".")
         self._wakeup.set()
-        return n_reset, n_skipped
+        return n_reset, n_skipped, n_skipped_status
 
     def set_default_repository(self, repository: str) -> None:
         with self._lock:
             self._state.default_repository = repository or ""
         self._set_message(f"Default repository set to: {repository!r}")
+
+    def signal_skip(self, relative_path: str) -> None:
+        """Tell the worker the user wants this file skipped.
+
+        If the file is the one currently being processed, also cancels the
+        in-flight LLM HTTP call so the worker can react within ~1 second
+        instead of waiting for the LLM to finish (item 7).
+        """
+        if not relative_path:
+            return
+        is_current = False
+        with self._lock:
+            self._state.skip_signals.add(relative_path)
+            is_current = (self._state.current_file == relative_path)
+        if is_current:
+            client = self._llm_client
+            if client is not None:
+                try:
+                    client.cancel()
+                except Exception:
+                    pass
+
+    def _consume_skip_signal(self, relative_path: str) -> bool:
+        """Check & remove a skip signal for `relative_path`. Returns True if
+        the user asked to skip this file."""
+        with self._lock:
+            if relative_path in self._state.skip_signals:
+                self._state.skip_signals.discard(relative_path)
+                return True
+            return False
 
     # --------------- worker thread ---------------
 
@@ -302,6 +348,11 @@ class JobManager:
                 created = datetime.fromtimestamp(st.st_ctime).isoformat(timespec="seconds")
                 modified = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
 
+                try:
+                    full_path = str(p.resolve())
+                except OSError:
+                    full_path = str(p)
+
                 status = self.db.upsert_file_basic(
                     relative_path=rel,
                     file_name=fname,
@@ -310,12 +361,23 @@ class JobManager:
                     sha256=sha,
                     os_created=created,
                     os_modified=modified,
+                    full_path=full_path,
                 )
                 n_seen += 1
                 if status == "pending":
                     n_added += 1
                 else:
                     n_unchanged += 1
+
+                # Item 6: auto-skip files that aren't documents or images.
+                # Only flip rows that are in 'pending' (don't override an
+                # already-done/error/skipped/processing decision).
+                if ext not in ALLOWED_DOC_OR_IMAGE_EXTENSIONS and status == "pending":
+                    self.db.mark_status(
+                        rel,
+                        "skipped",
+                        f"not_a_document_or_image: {ext or '(no extension)'}",
+                    )
 
                 if n_seen % 50 == 0:
                     self._set_message(
@@ -407,11 +469,64 @@ class JobManager:
         # Initialize per-file progress state
         self._begin_file(rec.relative_path)
 
+        # ---- Item 6 (defense in depth): never process a non-doc/non-image
+        # file even if it slipped past the scan-time check. ----
+        if rec.extension not in ALLOWED_DOC_OR_IMAGE_EXTENSIONS:
+            reason = f"not_a_document_or_image: {rec.extension or '(no extension)'}"
+            self._begin_step("skip_non_doc", percent=100, detail=reason)
+            self.db.mark_status(rec.relative_path, "skipped", reason)
+            self._set_message(f"Skipped (not a document or image): {rec.relative_path}")
+            self._end_step("skip_non_doc", percent=100, detail="skipped")
+            self._end_file()
+            return True  # success in the sense that the worker should move on
+
+        # ---- Item 1: if a byte-identical sibling is already 'done', reuse
+        # its extraction instead of running the LLM. ----
+        sibling = self.db.find_done_sibling(rec.sha256, rec.relative_path)
+        if sibling is not None:
+            with self._lock:
+                default_repo = self._state.default_repository
+            self._begin_step(
+                "dup_reuse",
+                percent=50,
+                detail=f"Reusing extraction from duplicate: {sibling.relative_path}",
+            )
+            ok_copy = self.db.copy_extraction_from_sibling(
+                rec.relative_path,
+                sibling.relative_path,
+                default_repository=default_repo,
+            )
+            if ok_copy:
+                self._end_step(
+                    "dup_reuse",
+                    percent=100,
+                    detail=f"Copied from {sibling.relative_path}",
+                )
+                self._set_message(
+                    f"Done (reused from duplicate): {rec.relative_path} "
+                    f"<= {sibling.relative_path}"
+                )
+                self._end_file()
+                return True
+            # If copy failed for any reason, fall through to normal extraction
+            self._end_step("dup_reuse", percent=50, detail="copy failed; falling back to LLM")
+
         try:
             # ---- Step 1: extract text from the file ----
             self._begin_step("extract_text", percent=5,
                              detail=f"Reading {rec.extension} file ({_fmt_size(rec.file_size)})...")
             res = extract_any(path, rec.extension)
+
+            # Item 7: user may have flipped this file to 'skipped' mid-flight
+            if self._consume_skip_signal(rec.relative_path):
+                self._end_step("extract_text", percent=10, detail="skipped by user")
+                self.db.mark_status(
+                    rec.relative_path, "skipped",
+                    "Skipped by user during processing.",
+                )
+                self._set_message(f"Skipped (user request) during extract_text: {rec.relative_path}")
+                self._end_file()
+                return True
 
             if res.extraction_error and not res.text:
                 self._end_step("extract_text", percent=10, detail=f"FAILED: {res.extraction_error}")
@@ -437,16 +552,51 @@ class JobManager:
 
             # ---- Step 2: LLM extraction ----
             override = self._consume_thinking_override(rec.relative_path)
-            thinking_label = "ON" if override else ("default" if override is None else "OFF")
+            # Resolve the actual boolean we'll send to the client so the log
+            # message reflects what's really happening (item 4).
+            effective_thinking = (
+                cfg.llm.thinking_default if override is None else override
+            )
+            thinking_label = "on" if effective_thinking else "off"
             self._begin_step("llm_extract", percent=35,
                              detail=f"Calling LLM (thinking={thinking_label})...")
 
-            extraction, used_thinking = client.extract(
-                text=text,
-                file_name=rec.file_name,
-                relative_path=rec.relative_path,
-                use_thinking=override,
-            )
+            try:
+                extraction, used_thinking = client.extract(
+                    text=text,
+                    file_name=rec.file_name,
+                    relative_path=rec.relative_path,
+                    use_thinking=override,
+                )
+            except LLMError as e:
+                # Item 7: if the LLM was cancelled because the user asked to
+                # skip this file, treat it as a clean skip rather than an error.
+                if self._consume_skip_signal(rec.relative_path):
+                    self._end_step("llm_extract", percent=50, detail="skipped by user (cancelled LLM)")
+                    self.db.mark_status(
+                        rec.relative_path, "skipped",
+                        "Skipped by user during processing.",
+                    )
+                    self._set_message(
+                        f"Skipped (user request) during llm_extract: {rec.relative_path}"
+                    )
+                    self._end_file()
+                    return True
+                raise
+
+            # Item 7: user flipped to 'skipped' between the LLM call returning
+            # and us writing to the DB. Honor it: do NOT save_extraction.
+            if self._consume_skip_signal(rec.relative_path):
+                self._end_step("llm_extract", percent=90, detail="skipped by user after LLM returned")
+                self.db.mark_status(
+                    rec.relative_path, "skipped",
+                    "Skipped by user during processing.",
+                )
+                self._set_message(
+                    f"Skipped (user request) after llm_extract: {rec.relative_path}"
+                )
+                self._end_file()
+                return True
 
             # Build a verbose summary of what the model produced
             ne = extraction.named_entities
@@ -461,7 +611,8 @@ class JobManager:
                 f"persons={len(ne.persons)}, orgs={len(ne.organizations)}, "
                 f"locs={len(ne.locations)}, products={len(ne.products_technologies)}, "
                 f"keyphrases={len(extraction.key_phrases)}, "
-                f"q={extraction.quality_score:.2f}, thinking={used_thinking}"
+                f"q={extraction.quality_score:.2f}, "
+                f"thinking={'on' if used_thinking else 'off'}"
             )
             self._end_step("llm_extract", percent=90, detail=verbose)
 
@@ -479,7 +630,9 @@ class JobManager:
             self._end_step("save", percent=100, detail="Saved")
 
             self._set_message(
-                f"Done: {rec.relative_path} (q={extraction.quality_score:.2f}, thinking={used_thinking})"
+                f"Done: {rec.relative_path} "
+                f"(q={extraction.quality_score:.2f}, "
+                f"thinking={'on' if used_thinking else 'off'})"
             )
             self._end_file()
             return True

@@ -229,9 +229,15 @@ class LMClient:
     )
     def _chat(self, user_msg: str, *, use_thinking: bool) -> str:
         # Qwen3.5 supports a thinking mode. LM Studio's OpenAI-compatible
-        # server accepts plain prompt directives like "/think" or "/no_think"
-        # appended to the system content.
+        # server accepts plain prompt directives like "/think" or "/no_think".
+        # Belt-and-braces: put the directive in BOTH the system message AND
+        # appended to the end of the user message — some Qwen3 builds in LM
+        # Studio only honor it reliably when present at the end of the user
+        # turn. We also pass `chat_template_kwargs.enable_thinking` for engines
+        # that read it from the chat template (e.g. vLLM); LM Studio currently
+        # ignores unknown fields, so this is harmless.
         directive = "/think" if use_thinking else "/no_think"
+        user_msg_with_directive = f"{user_msg}\n{directive}"
 
         # Build a conservative request body. We intentionally OMIT fields that
         # some LM Studio / engine versions reject with HTTP 400:
@@ -242,12 +248,13 @@ class LMClient:
             "model": self.cfg.model,
             "messages": [
                 {"role": "system", "content": f"{SYSTEM_PROMPT}\n{directive}"},
-                {"role": "user", "content": user_msg},
+                {"role": "user", "content": user_msg_with_directive},
             ],
             "temperature": float(self.cfg.temperature),
             "top_p": float(self.cfg.top_p),
             "max_tokens": int(self.cfg.max_output_tokens),
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": bool(use_thinking)},
         }
 
         try:

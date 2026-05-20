@@ -57,6 +57,7 @@ FileStatus = Literal["pending", "processing", "done", "error", "skipped"]
 
 class FileRecord(BaseModel):
     relative_path: str
+    full_path: str = ""                     # absolute resolved path on the host filesystem
     file_name: str
     extension: str
     file_size: int

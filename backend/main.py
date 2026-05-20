@@ -169,7 +169,7 @@ def api_set_repository(req: SetRepositoryRequest):
 def api_reevaluate(req: ReevaluateRequest):
     if not req.relative_paths:
         raise HTTPException(400, "relative_paths is required")
-    n_reset, n_skipped = job.reevaluate(
+    n_reset, n_skipped, n_skipped_status = job.reevaluate(
         req.relative_paths,
         use_thinking=req.use_thinking,
         force=req.force,
@@ -177,6 +177,9 @@ def api_reevaluate(req: ReevaluateRequest):
     return {
         "reset": n_reset,
         "skipped_manual": n_skipped,
+        # Files refused because they're in 'skipped' status. Caller should
+        # set their status to 'pending' first to re-evaluate them.
+        "skipped_status": n_skipped_status,
         "use_thinking": req.use_thinking,
         "force": req.force,
     }
@@ -194,6 +197,10 @@ def api_file_edit(relative_path: str, body: FileEditRequest):
     # If user re-queued the row, kick the worker
     if fields.get("status") == "pending":
         job._wakeup.set()  # noqa: SLF001 (intentional)
+    # Item 7: if the user just flipped this row to 'skipped' AND it's the
+    # file currently being processed, signal the worker so it aborts cleanly.
+    if fields.get("status") == "skipped":
+        job.signal_skip(relative_path)
     rec = db.get_file(relative_path)
     return rec.model_dump() if rec else {"ok": True}
 
@@ -211,6 +218,10 @@ def api_files_bulk_edit(body: BulkEditRequest):
     )
     if body.status == "pending":
         job._wakeup.set()  # noqa: SLF001
+    # Item 7: same as single edit — propagate skip signals to the worker.
+    if body.status == "skipped":
+        for p in body.relative_paths:
+            job.signal_skip(p)
     return {"updated": n}
 
 
@@ -350,6 +361,61 @@ def api_open_file(req: OpenFileRequest):
         raise HTTPException(500, f"Failed to open file: {e}")
 
     return {"ok": True, "opened": rel}
+
+
+@app.post("/api/open-file-location")
+def api_open_file_location(req: OpenFileRequest):
+    """Open the OS file explorer at the file's parent folder, with the
+    file selected/highlighted when the platform supports it.
+
+    Safety: only files inside the active target_folder may be revealed
+    (path-traversal guard, identical to /api/open-file). No extension
+    blocklist is needed because we never execute the file — we only open
+    its containing folder.
+    """
+    rel = (req.relative_path or "").strip()
+    if not rel:
+        raise HTTPException(400, "relative_path is required")
+
+    target_folder = job.snapshot().target_folder
+    if not target_folder:
+        raise HTTPException(400, "No active target folder")
+
+    try:
+        base = Path(target_folder).resolve()
+        full = (base / rel).resolve()
+        full.relative_to(base)  # raises if outside
+    except (ValueError, OSError):
+        raise HTTPException(400, "Invalid path")
+
+    # If the file went missing on disk, fall back to opening the parent
+    # folder (best-effort) so the user still gets close to where it lived.
+    parent = full if full.is_dir() else full.parent
+    if not parent.exists():
+        raise HTTPException(404, f"Folder not found: {parent}")
+
+    try:
+        if sys.platform.startswith("win"):
+            if full.exists():
+                # Open Explorer with the file pre-selected.
+                # Note: explorer.exe wants the path quoted.
+                import subprocess
+                subprocess.Popen(["explorer", f"/select,{str(full)}"])
+            else:
+                os.startfile(str(parent))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            import subprocess
+            if full.exists():
+                subprocess.Popen(["open", "-R", str(full)])
+            else:
+                subprocess.Popen(["open", str(parent)])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(parent)])
+    except Exception as e:
+        raise HTTPException(500, f"Failed to open file location: {e}")
+
+    return {"ok": True, "revealed": rel, "folder": str(parent)}
 
 
 # -------- WebSocket --------

@@ -81,3 +81,26 @@ def load_config(path: Path | None = None) -> AppConfig:
 
 def normalize_extensions(exts: list[str]) -> set[str]:
     return {e.lower() if e.startswith(".") else f".{e.lower()}" for e in exts}
+
+
+# Extensions we consider "documents" (text-bearing files we run through the
+# LLM extraction pipeline). Macro-enabled Office formats are included; they
+# are documents, the host app prompts before running macros.
+DOCUMENT_EXTENSIONS: set[str] = {
+    ".pdf",
+    ".docx", ".doc", ".docm",
+    ".pptx", ".ppt", ".pptm",
+    ".xlsx", ".xls", ".xlsm", ".xlsb",
+    ".txt", ".md", ".rtf", ".csv",
+    ".odt", ".ods", ".odp",
+}
+
+# Extensions we treat as images (the LLM still gets filename/path hints).
+IMAGE_EXTENSIONS: set[str] = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+    ".tif", ".tiff", ".webp", ".heic",
+}
+
+# The set of extensions allowed to be processed. Anything else is auto-
+# skipped (status='skipped', error='not_a_document_or_image: <ext>').
+ALLOWED_DOC_OR_IMAGE_EXTENSIONS: set[str] = DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS
