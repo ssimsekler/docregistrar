@@ -50,6 +50,24 @@ class LLMExtraction(BaseModel):
     custom_properties: list[KVPair] = Field(default_factory=list)  # user-defined K/V pairs
 
 
+# Set of LLMExtraction fields that count as "generated attributes" (i.e.
+# things the LLM produces). Editing any of these flips manually_edited=1.
+# User-managed fields (NOT in this set) do NOT flip the flag:
+#   - repository, source_url_1/2/3, custom_properties
+GENERATED_ATTRIBUTE_FIELDS: set[str] = {
+    "title", "description", "summary",
+    "document_date", "last_update_date",
+    "document_type", "language",
+    "authors", "version", "confidentiality",
+    "key_concepts", "key_phrases", "tags",
+    "geographic_scope", "industry_domain",
+    "quality_score",
+    # named-entity edit aliases used by FileEditRequest
+    "persons", "organizations", "locations",
+    "mentioned_dates", "products_technologies",
+}
+
+
 # -------- File record (one per file) --------
 
 FileStatus = Literal["pending", "processing", "done", "error", "skipped"]
@@ -57,9 +75,7 @@ FileStatus = Literal["pending", "processing", "done", "error", "skipped"]
 
 class FileRecord(BaseModel):
     relative_path: str
-    full_path: str = ""                     # absolute resolved path of the file on the host filesystem
-    full_folder_path: str = ""              # absolute path of the file's containing folder
-    relative_folder_path: str = ""          # folder path relative to the scanned target ("" for files at the root)
+    relative_folder_path: str = ""          # folder path relative to the repository root ("" for files at the root)
     file_name: str
     extension: str
     file_size: int
@@ -74,17 +90,42 @@ class FileRecord(BaseModel):
     indexing_completed_at: Optional[str] = None  # ISO datetime with TZ when processing finished
     extraction: Optional[LLMExtraction] = None
     used_thinking: bool = False
-    manually_edited: bool = False           # True if user has edited any field; protects from auto re-eval
+    manually_edited: bool = False           # True if user has edited any GENERATED attribute; protects from auto re-eval
     is_duplicate: bool = False              # True iff another file in the registry has the same SHA-256
     duplicate_group: str = ""               # SHA-256 string shared by all duplicates of this content
+
+
+# -------- Repository (master data) --------
+
+class Repository(BaseModel):
+    name: str
+    path: str = ""                          # absolute folder path; REQUIRED for new repos / scanning / opening
+    description: str = ""
+    created_at: str                         # ISO datetime, immutable
+    file_count: int = 0                     # how many files reference this repo
+
+
+class RepositoryCreateRequest(BaseModel):
+    name: str
+    path: str                               # required & non-empty
+    description: str = ""
+
+
+class RepositoryUpdateRequest(BaseModel):
+    path: Optional[str] = None              # if provided, must be non-empty
+    description: Optional[str] = None
+
+
+class RepositoryRenameRequest(BaseModel):
+    new_name: str
 
 
 # -------- API DTOs --------
 
 class StartRequest(BaseModel):
-    target_folder: str
-    registry_xlsx: str = ""
-    default_repository: str = ""
+    """Start a scan for the given repository. The scan root is the
+    repository's configured path."""
+    repository: str
 
 
 class SetRepositoryRequest(BaseModel):
@@ -171,7 +212,8 @@ class CurrentFileProgress(BaseModel):
 
 class ProgressSnapshot(BaseModel):
     state: Literal["idle", "scanning", "running", "paused", "stopping", "error"] = "idle"
-    target_folder: str = ""
+    target_folder: str = ""                 # the folder currently being scanned/processed (== repo path)
+    repository: str = ""                    # the active repository name
     total: int = 0
     done: int = 0
     error: int = 0

@@ -1,9 +1,9 @@
-"""Job manager: scans the target folder, runs LLM extraction per file,
+"""Job manager: scans a repository's folder, runs LLM extraction per file,
 supports pause/resume/stop and re-evaluation of selected files.
 
-Runs in a background thread (the LLM call is synchronous httpx). The FastAPI
-app communicates with it via thread-safe controls. Progress events are pushed
-to all connected WebSocket clients via an asyncio.Queue + a small bridge.
+Runs in a background thread. The FastAPI app communicates with it via
+thread-safe controls. Progress events are pushed to all connected
+WebSocket clients via an asyncio.Queue + a small bridge.
 """
 from __future__ import annotations
 
@@ -50,21 +50,22 @@ class _CurrentFile:
 @dataclass
 class _State:
     state: str = "idle"   # idle / scanning / running / paused / stopping / error
-    target_folder: str = ""
+    target_folder: str = ""           # equals the active repository's path while running
+    repository: str = ""              # active repository name
     registry_xlsx: str = ""
     current_file: str = ""
     started_at: Optional[str] = None
     last_message: str = ""
-    # Default repository assigned to files that get processed during this run.
-    default_repository: str = ""
     # Re-evaluation overrides keyed by relative_path
     thinking_overrides: dict[str, bool] = field(default_factory=dict)
     # Per-file fine-grained progress
     current_file_progress: Optional[_CurrentFile] = None
     # Set of relative_paths the user asked to skip while they are/were
-    # being processed. The worker checks this set between major steps and
-    # cleanly aborts the current file (item 7).
+    # being processed.
     skip_signals: set[str] = field(default_factory=set)
+    # If True, the worker should skip the scan phase and go straight to
+    # processing pending files (used by re-evaluation auto-start).
+    skip_scan: bool = False
 
 
 class JobManager:
@@ -127,6 +128,7 @@ class JobManager:
             return ProgressSnapshot(
                 state=self._state.state,                     # type: ignore[arg-type]
                 target_folder=self._state.target_folder,
+                repository=self._state.repository,
                 total=total,
                 done=counts.get("done", 0),
                 error=counts.get("error", 0),
@@ -144,40 +146,52 @@ class JobManager:
 
     def broadcast_progress(self) -> None:
         """Public hook so REST handlers can push fresh stats to clients
-        after a mutation that changes counts (item 5)."""
+        after a mutation that changes counts."""
         self._broadcast_progress()
 
-    def start(self, target_folder: str, registry_xlsx: str = "",
-              default_repository: str = "") -> None:
-        if self.is_running() and self._state.state not in ("paused",):
-            # Just update the default repository if running
-            with self._lock:
-                self._state.default_repository = default_repository or self._state.default_repository
-            self._set_message("Already running; default repository updated.")
+    def start(self, repository: str) -> None:
+        """Start a scan + processing run for the given repository.
+
+        The repository must exist and have a non-empty path configured.
+        """
+        repository = (repository or "").strip()
+        if not repository:
+            self._set_state("error", "Repository is required to start.")
             return
 
-        target = Path(target_folder).expanduser().resolve()
+        repo = self.db.get_repository(repository)
+        if repo is None:
+            self._set_state("error", f"Repository not found: {repository!r}")
+            return
+        if not repo.path:
+            self._set_state(
+                "error",
+                f"Repository {repository!r} has no path configured. "
+                "Edit the repository (Browse repos) and set its Path first.",
+            )
+            return
+
+        target = Path(repo.path).expanduser().resolve()
         if not target.exists() or not target.is_dir():
-            self._set_state("error", f"Target folder does not exist: {target}")
+            self._set_state("error", f"Repository folder does not exist: {target}")
             return
 
         # If we were paused, just resume.
         if self.is_running() and self._state.state == "paused":
-            with self._lock:
-                self._state.default_repository = default_repository or self._state.default_repository
             self.resume()
+            return
+
+        if self.is_running() and self._state.state not in ("paused",):
+            self._set_message("Already running.")
             return
 
         with self._lock:
             self._state.target_folder = str(target)
-            self._state.registry_xlsx = (
-                registry_xlsx
-                or self.cfg.registry_xlsx
-                or str(target / "registry.xlsx")
-            )
+            self._state.repository = repository
+            self._state.registry_xlsx = self.cfg.registry_xlsx or str(target / "registry.xlsx")
             self._state.started_at = now_iso()
-            self._state.default_repository = default_repository or ""
             self._state.thinking_overrides.clear()
+            self._state.skip_scan = False
 
         # Recover any "processing" rows from a prior crash
         n = self.db.reset_in_progress_to_pending()
@@ -190,7 +204,7 @@ class JobManager:
             target=self._run, name="docregistrar-worker", daemon=True
         )
         self._thread.start()
-        self._set_state("scanning", "Started")
+        self._set_state("scanning", f"Started scan of repository {repository!r}")
 
     def pause(self) -> None:
         if not self.is_running():
@@ -206,9 +220,6 @@ class JobManager:
         self._wakeup.set()
 
     def stop(self) -> None:
-        # Item 4: even if the worker thread is no longer alive, force the
-        # state to 'idle' so the UI doesn't get stuck on 'stopping' or
-        # 'running' forever.
         if not self.is_running():
             with self._lock:
                 if self._state.state != "idle":
@@ -222,9 +233,6 @@ class JobManager:
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused
         self._wakeup.set()
-        # Forcibly close the in-flight LLM HTTP socket so the worker
-        # exits its httpx.post() within milliseconds instead of waiting
-        # for the LLM to finish.
         client = self._llm_client
         if client is not None:
             try:
@@ -233,9 +241,6 @@ class JobManager:
                 pass
 
     def shutdown_blocking(self, timeout: float = 5.0) -> None:
-        """Used by FastAPI shutdown hook (Ctrl+C). Like stop() but
-        also joins the worker thread so uvicorn can exit cleanly.
-        """
         self.stop()
         t = self._thread
         if t is not None:
@@ -243,13 +248,11 @@ class JobManager:
 
     def reevaluate(self, relative_paths: list[str], use_thinking: bool = False,
                    force: bool = False) -> tuple[int, int, int]:
-        """Reset the given files to 'pending' (will be picked up on next scan loop).
+        """Reset the given files to 'pending' and ensure the worker is
+        running so they get processed. If the worker is idle, kick off a
+        no-scan run that goes straight into processing.
 
         Returns (n_reset, n_skipped_due_to_manual_edit, n_skipped_status_skipped).
-        - Manually-edited rows are skipped unless `force=True`.
-        - Rows currently in 'skipped' status are ALWAYS refused (item 5);
-          their `error` field is set to a hint instructing the user to
-          flip the status to 'pending' first.
         """
         n_reset, n_skipped, n_skipped_status = self.db.reset_to_pending(
             relative_paths, force=force,
@@ -266,20 +269,41 @@ class JobManager:
                     f"(set their status to 'pending' first)")
         self._set_message(msg + ".")
         self._wakeup.set()
+
+        # If the worker is idle and we actually queued at least one file,
+        # auto-start a no-scan processing run so the user doesn't have to
+        # press Start manually.
+        if n_reset > 0 and not self.is_running():
+            self._start_eval_only_run()
         return n_reset, n_skipped, n_skipped_status
 
-    def set_default_repository(self, repository: str) -> None:
+    def _start_eval_only_run(self) -> None:
+        """Start the worker thread in skip-scan mode.
+
+        Used by re-evaluation when the worker is idle. We don't scan any
+        folder; we just go straight to _process_loop. Each file's path
+        for actual reading off disk is resolved through its repository
+        master record (see _process_one).
+        """
         with self._lock:
-            self._state.default_repository = repository or ""
-        self._set_message(f"Default repository set to: {repository!r}")
+            self._state.skip_scan = True
+            self._state.started_at = now_iso()
+            self._state.thinking_overrides = self._state.thinking_overrides
+
+        # Recover any "processing" rows from a prior crash
+        n = self.db.reset_in_progress_to_pending()
+        if n:
+            log.info("Recovered %d 'processing' rows back to 'pending'.", n)
+
+        self._stop_event.clear()
+        self._pause_event.set()
+        self._thread = threading.Thread(
+            target=self._run, name="docregistrar-worker-eval", daemon=True
+        )
+        self._thread.start()
+        self._set_state("running", "Re-evaluation: processing queued files...")
 
     def signal_skip(self, relative_path: str) -> None:
-        """Tell the worker the user wants this file skipped.
-
-        If the file is the one currently being processed, also cancels the
-        in-flight LLM HTTP call so the worker can react within ~1 second
-        instead of waiting for the LLM to finish (item 7).
-        """
         if not relative_path:
             return
         is_current = False
@@ -295,8 +319,6 @@ class JobManager:
                     pass
 
     def _consume_skip_signal(self, relative_path: str) -> bool:
-        """Check & remove a skip signal for `relative_path`. Returns True if
-        the user asked to skip this file."""
         with self._lock:
             if relative_path in self._state.skip_signals:
                 self._state.skip_signals.discard(relative_path)
@@ -307,14 +329,19 @@ class JobManager:
 
     def _run(self) -> None:
         try:
-            self._scan_target_folder()
-            self._set_state("running", "Scan complete; processing files...")
+            with self._lock:
+                skip_scan = self._state.skip_scan
+                self._state.skip_scan = False  # one-shot
+            if not skip_scan:
+                self._scan_target_folder()
+                self._set_state("running", "Scan complete; processing files...")
+            else:
+                self._set_state("running", "Processing queued files...")
             self._process_loop()
         except Exception as e:
             log.exception("Worker crashed")
             self._set_state("error", f"Worker crashed: {e}")
         finally:
-            # Final Excel write
             self._regenerate_excel()
             with self._lock:
                 if self._state.state not in ("error",):
@@ -326,6 +353,7 @@ class JobManager:
 
     def _scan_target_folder(self) -> None:
         target = Path(self._state.target_folder)
+        repository = self._state.repository
         include = normalize_extensions(self.cfg.include_extensions)
         ignore_dirs = {n.lower() for n in self.cfg.ignore_dir_names}
         max_size = self.cfg.extract.max_file_size_bytes
@@ -363,18 +391,6 @@ class JobManager:
                 created = datetime.fromtimestamp(st.st_ctime).isoformat(timespec="seconds")
                 modified = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
 
-                # Item 3: store both the file's full absolute path and its
-                # parent folder's full + relative paths so the UI can open
-                # files even after the worker is idle (i.e. when no active
-                # target_folder is set on the JobManager).
-                try:
-                    full_path = str(p.resolve())
-                    full_folder_path = str(p.resolve().parent)
-                except OSError:
-                    full_path = str(p)
-                    full_folder_path = str(p.parent)
-                # parent folder path relative to the scanned target ("" if
-                # the file is at the root of the scanned folder).
                 rel_parent = str(p.parent.relative_to(target)).replace("\\", "/")
                 if rel_parent in (".", ""):
                     relative_folder_path = ""
@@ -389,19 +405,21 @@ class JobManager:
                     sha256=sha,
                     os_created=created,
                     os_modified=modified,
-                    full_path=full_path,
-                    full_folder_path=full_folder_path,
                     relative_folder_path=relative_folder_path,
                 )
+
+                # Auto-assign the active repository to this file (without
+                # touching manually_edited).
+                if repository:
+                    self.db.assign_repository(rel, repository)
+
                 n_seen += 1
                 if status == "pending":
                     n_added += 1
                 else:
                     n_unchanged += 1
 
-                # Item 6: auto-skip files that aren't documents or images.
-                # Only flip rows that are in 'pending' (don't override an
-                # already-done/error/skipped/processing decision).
+                # Auto-skip files that aren't documents or images.
                 if ext not in ALLOWED_DOC_OR_IMAGE_EXTENSIONS and status == "pending":
                     self.db.mark_status(
                         rel,
@@ -414,10 +432,9 @@ class JobManager:
                         f"Scanned {n_seen} files (queued {n_added}, unchanged {n_unchanged})..."
                     )
 
-        # Remove DB rows for files no longer on disk
-        removed = self.db.delete_files_not_in(present)
+        # Remove DB rows for files no longer on disk WITHIN this repo only
+        removed = self.db.delete_files_not_in_repo(repository, present) if repository else 0
 
-        # Recompute duplicate flags authoritatively for the whole registry
         n_groups = self.db.recompute_duplicates()
 
         self._set_message(
@@ -433,7 +450,6 @@ class JobManager:
         try:
             processed_since_xlsx = 0
             while not self._stop_event.is_set():
-                # Wait while paused
                 if not self._pause_event.is_set():
                     self._set_state("paused", "Paused")
                     self._pause_event.wait()
@@ -443,9 +459,6 @@ class JobManager:
 
                 rec = self.db.next_pending()
                 if rec is None:
-                    # Item 4: no more pending work -> auto-stop the worker
-                    # so the UI returns to a clean idle state. The user
-                    # can press Start again to scan / resume processing.
                     self._regenerate_excel()
                     self._set_state("idle", "Idle — no pending work; worker stopped.")
                     return
@@ -455,9 +468,7 @@ class JobManager:
                     self._state.current_file = rec.relative_path
                 self._broadcast_progress()
 
-                # If we got cancelled mid-flight, the LLM client is now dead.
-                # Re-create it so the next iteration can talk to LM Studio.
-                if client._cancelled:  # noqa: SLF001 (intentional)
+                if client._cancelled:  # noqa: SLF001
                     log.info("LLM client was cancelled; recreating.")
                     try:
                         client.close()
@@ -469,7 +480,6 @@ class JobManager:
                 ok = self._process_one(client, rec)
                 processed_since_xlsx += 1
 
-                # If Stop was pressed during this file, requeue it
                 if self._stop_event.is_set():
                     self.db.mark_status(rec.relative_path, "pending", "")
                     self._set_message(f"Requeued {rec.relative_path} (stopped during processing)")
@@ -479,7 +489,6 @@ class JobManager:
                     self._regenerate_excel()
                     processed_since_xlsx = 0
 
-            # Drain
             self._regenerate_excel()
         finally:
             try:
@@ -488,16 +497,28 @@ class JobManager:
                 pass
             self._llm_client = None
 
+    def _resolve_file_for_processing(self, rec) -> Optional[Path]:
+        """Resolve the absolute Path on disk for a file the worker is
+        about to process. Uses the file's repository master record.
+
+        Returns None if the file's repo is missing or has no path.
+        """
+        repo_path = self.db.repo_path_for_file(rec.relative_path)
+        if not repo_path:
+            return None
+        rfp = (rec.relative_folder_path or "").replace("\\", "/")
+        base = Path(repo_path)
+        if rfp:
+            return base / rfp / rec.file_name
+        return base / rec.file_name
+
     def _process_one(self, client: LMClient, rec) -> bool:
         cfg = self.cfg
-        target = Path(self._state.target_folder)
-        path = target / rec.relative_path
 
         # Initialize per-file progress state
         self._begin_file(rec.relative_path)
 
-        # ---- Item 6 (defense in depth): never process a non-doc/non-image
-        # file even if it slipped past the scan-time check. ----
+        # Auto-skip files that aren't documents or images.
         if rec.extension not in ALLOWED_DOC_OR_IMAGE_EXTENSIONS:
             reason = f"not_a_document_or_image: {rec.extension or '(no extension)'}"
             self._begin_step("skip_non_doc", percent=100, detail=reason)
@@ -505,14 +526,34 @@ class JobManager:
             self._set_message(f"Skipped (not a document or image): {rec.relative_path}")
             self._end_step("skip_non_doc", percent=100, detail="skipped")
             self._end_file()
-            return True  # success in the sense that the worker should move on
+            return True
 
-        # ---- Item 1: if a byte-identical sibling is already 'done', reuse
-        # its extraction instead of running the LLM. ----
+        # Resolve the file's actual location via its repository's path
+        path = self._resolve_file_for_processing(rec)
+        if path is None:
+            reason = (
+                "Cannot resolve file path: file has no repository assigned, "
+                "or its repository has no path configured."
+            )
+            self._begin_step("resolve_path", percent=5, detail=reason)
+            self.db.mark_status(rec.relative_path, "error", reason)
+            self._set_message(f"Path resolution failed: {rec.relative_path}")
+            self._end_step("resolve_path", percent=10, detail="failed")
+            self._end_file()
+            return False
+        if not path.exists():
+            reason = f"File not found at resolved path: {path}"
+            self._begin_step("resolve_path", percent=5, detail=reason)
+            self.db.mark_status(rec.relative_path, "error", reason)
+            self._set_message(f"Path resolution failed: {rec.relative_path}")
+            self._end_step("resolve_path", percent=10, detail="missing")
+            self._end_file()
+            return False
+
+        # Reuse extraction from a byte-identical sibling that's already done.
         sibling = self.db.find_done_sibling(rec.sha256, rec.relative_path)
         if sibling is not None:
-            with self._lock:
-                default_repo = self._state.default_repository
+            default_repo = self._state.repository or ""
             self._begin_step(
                 "dup_reuse",
                 percent=50,
@@ -535,16 +576,13 @@ class JobManager:
                 )
                 self._end_file()
                 return True
-            # If copy failed for any reason, fall through to normal extraction
             self._end_step("dup_reuse", percent=50, detail="copy failed; falling back to LLM")
 
         try:
-            # ---- Step 1: extract text from the file ----
             self._begin_step("extract_text", percent=5,
                              detail=f"Reading {rec.extension} file ({_fmt_size(rec.file_size)})...")
             res = extract_any(path, rec.extension)
 
-            # Item 7: user may have flipped this file to 'skipped' mid-flight
             if self._consume_skip_signal(rec.relative_path):
                 self._end_step("extract_text", percent=10, detail="skipped by user")
                 self.db.mark_status(
@@ -577,10 +615,7 @@ class JobManager:
             if sent_len < text_len:
                 self._set_detail(f"Truncated to {sent_len:,} chars (head/middle/tail) before sending to LLM")
 
-            # ---- Step 2: LLM extraction ----
             override = self._consume_thinking_override(rec.relative_path)
-            # Resolve the actual boolean we'll send to the client so the log
-            # message reflects what's really happening (item 4).
             effective_thinking = (
                 cfg.llm.thinking_default if override is None else override
             )
@@ -596,8 +631,6 @@ class JobManager:
                     use_thinking=override,
                 )
             except LLMError as e:
-                # Item 7: if the LLM was cancelled because the user asked to
-                # skip this file, treat it as a clean skip rather than an error.
                 if self._consume_skip_signal(rec.relative_path):
                     self._end_step("llm_extract", percent=50, detail="skipped by user (cancelled LLM)")
                     self.db.mark_status(
@@ -611,8 +644,6 @@ class JobManager:
                     return True
                 raise
 
-            # Item 7: user flipped to 'skipped' between the LLM call returning
-            # and us writing to the DB. Honor it: do NOT save_extraction.
             if self._consume_skip_signal(rec.relative_path):
                 self._end_step("llm_extract", percent=90, detail="skipped by user after LLM returned")
                 self.db.mark_status(
@@ -625,7 +656,6 @@ class JobManager:
                 self._end_file()
                 return True
 
-            # Build a verbose summary of what the model produced
             ne = extraction.named_entities
             verbose = (
                 f"title={'yes' if extraction.title else 'no'}, "
@@ -643,10 +673,8 @@ class JobManager:
             )
             self._end_step("llm_extract", percent=90, detail=verbose)
 
-            # ---- Step 3: persist ----
             self._begin_step("save", percent=95, detail="Saving to local DB...")
-            with self._lock:
-                default_repo = self._state.default_repository
+            default_repo = self._state.repository or ""
             self.db.save_extraction(
                 relative_path=rec.relative_path,
                 page_count=res.page_count,
@@ -728,7 +756,6 @@ class JobManager:
             for s in reversed(cfp.steps):
                 if s["name"] == name and s["finished_at"] is None:
                     s["finished_at"] = now_iso()
-                    # Compute duration from started_at
                     try:
                         t0 = datetime.fromisoformat(s["started_at"])
                         t1 = datetime.fromisoformat(s["finished_at"])
@@ -784,7 +811,8 @@ class JobManager:
             return
         records = self.db.list_all_for_excel()
         out = Path(self._state.registry_xlsx)
-        ok = write_registry(records, out)
+        repo_paths = {r.name: r.path for r in self.db.list_repositories()}
+        ok = write_registry(records, out, repo_paths)
         if ok:
             self._set_message(f"Registry updated: {out}")
         else:
@@ -825,7 +853,6 @@ def _safe_put(q: asyncio.Queue, item) -> None:
     try:
         q.put_nowait(item)
     except asyncio.QueueFull:
-        # Drop oldest, push newest
         try:
             q.get_nowait()
         except Exception:
@@ -841,7 +868,6 @@ def _walk(root: Path, ignore_dir_names_lower: set[str]):
     import os
 
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune in place
         dirnames[:] = [d for d in dirnames if d.lower() not in ignore_dir_names_lower]
         yield Path(dirpath), dirnames, filenames
 

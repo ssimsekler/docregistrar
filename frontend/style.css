@@ -575,3 +575,68 @@ tbody tr.dup-row td { box-shadow: inset 3px 0 0 var(--amber); }
   font-size: 12px;
   font-style: italic;
 }
+
+/* Repository management dialog (master data) */
+.modal.modal-wide { width: min(900px, 96vw); }
+
+.repo-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.repo-table th, .repo-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.repo-table th {
+  background: var(--panel-2);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.repo-table tbody tr.selected-repo { background: rgba(59,130,246,0.18); }
+.repo-table .repo-actions { display: flex; gap: 4px; }
+.repo-table .repo-actions button { padding: 3px 6px; font-size: 11px; }
+.repo-table input {
+  width: 100%;
+  padding: 4px 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+}
+.repo-add-row {
+  display: grid;
+  grid-template-columns: 1fr 1.5fr auto auto auto;
+  gap: 6px;
+  padding: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.repo-add-row input {
+  padding: 6px 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.repo-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+.repo-pill .repo-pill-name { font-weight: 600; color: var(--accent-2); }
+.repo-pill .repo-pill-path { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.repo-pill .repo-pill-empty { color: var(--amber); font-size: 12px; font-style: italic; }

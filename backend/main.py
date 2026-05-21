@@ -24,14 +24,15 @@ from .schemas import (
     DeleteFilesRequest,
     FileEditRequest,
     ReevaluateRequest,
+    RepositoryCreateRequest,
+    RepositoryRenameRequest,
+    RepositoryUpdateRequest,
     SetRepositoryRequest,
     SkipDupSiblingsRequest,
     StartRequest,
 )
 
-# Extensions blocked by POST /api/open-file. Everything else is allowed,
-# including macro-enabled Office files (.xlsm, .docm, .pptm, .xlsb), which
-# are documents (the host app prompts before running macros).
+# Extensions blocked by POST /api/open-file.
 BLOCKED_OPEN_EXTENSIONS = {
     ".exe", ".bat", ".cmd", ".com", ".msi", ".scr",
     ".ps1", ".vbs", ".vbe", ".js", ".jse",
@@ -55,7 +56,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 db = Database(DATA_DIR / "state.db")
 job = JobManager(cfg, db, DATA_DIR)
 
-app = FastAPI(title="docregistrar", version="0.2.0")
+app = FastAPI(title="docregistrar", version="0.3.0")
 
 FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
@@ -68,11 +69,6 @@ async def _on_startup() -> None:
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
-    """Graceful shutdown for Ctrl+C from run.bat.
-
-    Closes the in-flight LLM HTTP socket and joins the worker thread so
-    uvicorn can exit promptly.
-    """
     log.info("Shutdown requested - stopping worker and closing LLM client...")
     try:
         job.shutdown_blocking(timeout=5.0)
@@ -90,7 +86,6 @@ def api_config():
         "llm_model": cfg.llm.model,
         "llm_base_url": cfg.llm.base_url,
         "include_extensions": cfg.include_extensions,
-        "default_target_folder": cfg.target_folder,
     }
 
 
@@ -113,7 +108,7 @@ def api_pick_folder():
             pass
         path = filedialog.askdirectory(
             parent=root,
-            title="Select folder to scan",
+            title="Select folder",
             mustexist=True,
         )
     finally:
@@ -132,13 +127,9 @@ def api_progress():
 
 @app.post("/api/start")
 def api_start(req: StartRequest):
-    if not req.target_folder.strip():
-        raise HTTPException(400, "target_folder is required")
-    job.start(
-        req.target_folder,
-        req.registry_xlsx,
-        default_repository=req.default_repository,
-    )
+    if not (req.repository or "").strip():
+        raise HTTPException(400, "repository is required")
+    job.start(req.repository.strip())
     return job.snapshot().model_dump()
 
 
@@ -160,20 +151,68 @@ def api_stop():
     return job.snapshot().model_dump()
 
 
-@app.post("/api/repository")
-def api_set_repository(req: SetRepositoryRequest):
-    """Update the default repository assigned to files processed from now on."""
-    job.set_default_repository(req.repository)
-    return {"repository": req.repository}
-
+# -------- Repository (master data) endpoints --------
 
 @app.get("/api/repositories")
 def api_list_repositories():
-    """List all distinct, non-empty Repository values currently in use across
-    the registry, with usage counts. Powers the "Browse repositories"
-    picker in the UI.
+    """List all repositories (with file counts) sorted alphabetically."""
+    repos = db.list_repositories()
+    return {"items": [r.model_dump() for r in repos]}
+
+
+@app.get("/api/repositories/{name}")
+def api_get_repository(name: str):
+    rec = db.get_repository(name)
+    if rec is None:
+        raise HTTPException(404, f"Repository not found: {name!r}")
+    return rec.model_dump()
+
+
+@app.post("/api/repositories")
+def api_create_repository(body: RepositoryCreateRequest):
+    try:
+        rec = db.create_repository(body.name, body.path, body.description or "")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    job.broadcast_progress()
+    return rec.model_dump()
+
+
+@app.patch("/api/repositories/{name}")
+def api_update_repository(name: str, body: RepositoryUpdateRequest):
+    try:
+        rec = db.update_repository(
+            name,
+            path=body.path,
+            description=body.description,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    job.broadcast_progress()
+    return rec.model_dump()
+
+
+@app.post("/api/repositories/{name}/rename")
+def api_rename_repository(name: str, body: RepositoryRenameRequest):
+    try:
+        rec = db.rename_repository(name, body.new_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    job.broadcast_progress()
+    return rec.model_dump()
+
+
+@app.delete("/api/repositories/{name}")
+def api_delete_repository(name: str):
+    """Delete a repository AND clear its assignment from any referencing files.
+    Returns the number of files affected.
     """
-    return {"items": db.list_repositories()}
+    try:
+        n = db.delete_repository(name, clear_files=True)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    job.broadcast_progress()
+    return {"deleted": True, "files_cleared": n}
 
 
 @app.post("/api/reevaluate")
@@ -185,14 +224,10 @@ def api_reevaluate(req: ReevaluateRequest):
         use_thinking=req.use_thinking,
         force=req.force,
     )
-    # Item 5: re-eval changes status counts (rows flip back to 'pending');
-    # push fresh stats to clients so the header refreshes immediately.
     job.broadcast_progress()
     return {
         "reset": n_reset,
         "skipped_manual": n_skipped,
-        # Files refused because they're in 'skipped' status. Caller should
-        # set their status to 'pending' first to re-evaluate them.
         "skipped_status": n_skipped_status,
         "use_thinking": req.use_thinking,
         "force": req.force,
@@ -208,18 +243,13 @@ def api_file_edit(relative_path: str, body: FileEditRequest):
     ok = db.update_fields(relative_path, fields)
     if not ok:
         raise HTTPException(404, f"Not found: {relative_path}")
-    # If user re-queued the row, kick the worker
     if fields.get("status") == "pending":
-        job._wakeup.set()  # noqa: SLF001 (intentional)
-    # Item 7: if the user just flipped this row to 'skipped' AND it's the
-    # file currently being processed, signal the worker so it aborts cleanly.
+        job._wakeup.set()  # noqa: SLF001
     if fields.get("status") == "skipped":
         job.signal_skip(relative_path)
-    # Item 5: any field edit may change the visible counts (e.g. status
-    # changes, repository changes). Push fresh stats to all WS clients.
     job.broadcast_progress()
     rec = db.get_file(relative_path)
-    return rec.model_dump() if rec else {"ok": True}
+    return _decorate_file_response(rec)
 
 
 @app.post("/api/files/bulk-edit")
@@ -235,13 +265,36 @@ def api_files_bulk_edit(body: BulkEditRequest):
     )
     if body.status == "pending":
         job._wakeup.set()  # noqa: SLF001
-    # Item 7: same as single edit — propagate skip signals to the worker.
     if body.status == "skipped":
         for p in body.relative_paths:
             job.signal_skip(p)
-    # Item 5: bulk edits commonly change status counts; push a fresh snapshot.
     job.broadcast_progress()
     return {"updated": n}
+
+
+def _decorate_file_response(rec) -> dict:
+    """Return a record dict augmented with convenience fields used by the UI:
+       - repository_path: configured path of the file's repository (read-only)
+       - flattened extraction-derived fields used by the grid
+    """
+    if rec is None:
+        return {}
+    d = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec)
+    e = d.get("extraction") or {}
+    if isinstance(e, dict):
+        ne = e.get("named_entities") or {}
+    else:
+        e = {}
+        ne = {}
+    repo_name = e.get("repository", "") if isinstance(e, dict) else ""
+    repo_path = ""
+    if repo_name:
+        rec_repo = db.get_repository(repo_name)
+        if rec_repo is not None:
+            repo_path = rec_repo.path or ""
+    d["repository"] = repo_name
+    d["repository_path"] = repo_path
+    return d
 
 
 @app.get("/api/files")
@@ -252,10 +305,6 @@ def api_files(
     offset: int = 0,
     sha256: str | None = None,
     duplicates_only: bool = False,
-    # Item 6: filter the grid by Repository.
-    #   - parameter omitted entirely  -> no repository filter (all rows)
-    #   - parameter present but empty -> rows whose repository is empty
-    #   - parameter present, non-empty -> exact-match repository filter
     repository: str | None = None,
 ):
     records = db.list_files(
@@ -267,11 +316,21 @@ def api_files(
         duplicates_only=duplicates_only,
         repository=repository,
     )
+    # Pre-fetch repo paths into a lookup to avoid N queries
+    repo_map: dict[str, str] = {}
+    for r in records:
+        e = r.extraction.model_dump() if r.extraction else {}
+        repo_name = e.get("repository", "") or ""
+        if repo_name and repo_name not in repo_map:
+            rec_repo = db.get_repository(repo_name)
+            repo_map[repo_name] = rec_repo.path if rec_repo else ""
+
     out = []
     for r in records:
         d = r.model_dump()
         e = d.pop("extraction", None) or {}
         ne = (e.get("named_entities") or {}) if e else {}
+        repo_name = e.get("repository", "") or ""
         d["title"] = e.get("title", "")
         d["description"] = e.get("description", "")
         d["document_type"] = e.get("document_type", "")
@@ -283,7 +342,8 @@ def api_files(
         d["tags"] = e.get("tags", [])
         d["geographic_scope"] = e.get("geographic_scope", "")
         d["industry_domain"] = e.get("industry_domain", "")
-        d["repository"] = e.get("repository", "")
+        d["repository"] = repo_name
+        d["repository_path"] = repo_map.get(repo_name, "")
         d["products_technologies"] = ne.get("products_technologies", [])
         d["custom_properties"] = e.get("custom_properties", [])
         out.append(d)
@@ -295,7 +355,7 @@ def api_file(relative_path: str):
     rec = db.get_file(relative_path)
     if rec is None:
         raise HTTPException(404, f"Not found: {relative_path}")
-    return rec.model_dump()
+    return _decorate_file_response(rec)
 
 
 @app.get("/api/file/dup-siblings")
@@ -311,47 +371,32 @@ def api_file_dup_siblings(relative_path: str):
 
 @app.post("/api/files/skip-dup-siblings")
 def api_skip_dup_siblings(body: SkipDupSiblingsRequest):
-    """For every file in `relative_paths`, mark every OTHER file sharing the
-    same SHA-256 as 'skipped'. The given files themselves are NOT modified.
-    """
     if not body.relative_paths:
         raise HTTPException(400, "relative_paths is required")
     n = db.skip_dup_siblings_of(body.relative_paths)
-    # Item 5: rows have flipped to 'skipped' so the header counts changed.
     job.broadcast_progress()
     return {"updated": n}
 
 
 @app.post("/api/files/delete")
 def api_files_delete(body: DeleteFilesRequest):
-    """Permanently remove the given files from the registry.
-
-    The actual file on disk is NOT deleted. If the containing folder is
-    later rescanned, each file will be re-discovered and added back as a
-    fresh 'pending' entry.
-
-    If any of the targeted files is currently being processed by the
-    worker, we send a skip signal first so the worker stops touching it
-    and doesn't try to write back a row that's about to be deleted.
-    """
+    """Permanently remove the given files from the registry."""
     if not body.relative_paths:
         raise HTTPException(400, "relative_paths is required")
-    # If any of them is the currently-processing file, signal the worker to
-    # abort that file cleanly (it'll be requeued/skipped). Then we delete.
     for p in body.relative_paths:
         if p:
             job.signal_skip(p)
     n = db.delete_files(body.relative_paths)
-    # Item 5: counts changed -> push fresh stats.
     job.broadcast_progress()
     return {"deleted": n}
 
 
 @app.get("/api/registry.xlsx")
 def api_registry_download():
-    """Download the current registry as an Excel file. Snapshot at click time."""
+    """Download the current registry as an Excel file."""
     records = db.list_all_for_excel()
-    data = build_registry_bytes(records)
+    repos = {r.name: r.path for r in db.list_repositories()}
+    data = build_registry_bytes(records, repos)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     filename = f"docregistrar_{ts}.xlsx"
     return Response(
@@ -362,35 +407,37 @@ def api_registry_download():
 
 
 def _resolve_file_path(rel: str) -> Path:
-    """Resolve the absolute Path on disk for a registry row, even when the
-    JobManager is idle (items 1, 2, 3).
-
-    Strategy:
-      1. Look up the row in the DB. If it has a non-empty `full_path`, use it.
-      2. Otherwise try `full_folder_path` + file_name.
-      3. As a last resort, fall back to the active `target_folder` + rel.
-    Raises HTTPException on any failure.
+    """Resolve the absolute Path on disk for a registry row using the
+    file's repository's configured path + relative_folder_path + file_name.
     """
     rec = db.get_file(rel)
     if rec is None:
         raise HTTPException(404, f"File not found in registry: {rel}")
 
-    candidate: Optional[Path] = None
-    if rec.full_path:
-        candidate = Path(rec.full_path)
-    elif rec.full_folder_path and rec.file_name:
-        candidate = Path(rec.full_folder_path) / rec.file_name
-
-    if candidate is None:
-        target_folder = job.snapshot().target_folder
-        if not target_folder:
-            raise HTTPException(
-                400,
-                "No stored full_path for this file and no active target "
-                "folder. Re-scan the folder so paths get recorded.",
-            )
-        candidate = Path(target_folder) / rel
-
+    e = rec.extraction.model_dump() if rec.extraction else {}
+    repo_name = (e.get("repository") or "").strip() if isinstance(e, dict) else ""
+    if not repo_name:
+        raise HTTPException(
+            400,
+            "This file has no repository assigned. Assign a repository "
+            "(via Edit or bulk-edit) so its full path can be resolved.",
+        )
+    repo = db.get_repository(repo_name)
+    if repo is None:
+        raise HTTPException(
+            400,
+            f"Repository {repo_name!r} no longer exists. Re-create it (with a path) "
+            "or assign this file to a different repository.",
+        )
+    if not repo.path:
+        raise HTTPException(
+            400,
+            f"Repository {repo_name!r} has no path configured. Open 'Browse repos' "
+            "and set its Path.",
+        )
+    base = Path(repo.path)
+    rfp = (rec.relative_folder_path or "").replace("\\", "/")
+    candidate = base / rfp / rec.file_name if rfp else base / rec.file_name
     try:
         return candidate.resolve()
     except OSError:
@@ -401,15 +448,7 @@ def _resolve_file_path(rel: str) -> Path:
 def api_open_file(req: OpenFileRequest):
     """Open a file from the registry in the OS default app.
 
-    Item 1 + 3: works even when the JobManager is idle, because we look up
-    the file's stored absolute path from the DB instead of requiring an
-    active target_folder.
-
-    Safety:
-      - Extensions in BLOCKED_OPEN_EXTENSIONS (executables / scripts) are
-        refused with HTTP 403.
-      - Macro-enabled Office files (.xlsm, .docm, .pptm, .xlsb) are allowed:
-        they are documents, and the host app shows its own macro warning.
+    Path is resolved as: repository.path / relative_folder_path / file_name.
     """
     rel = (req.relative_path or "").strip()
     if not rel:
@@ -445,52 +484,23 @@ def api_open_file(req: OpenFileRequest):
 
 @app.post("/api/open-file-location")
 def api_open_file_location(req: OpenFileRequest):
-    """Open the OS file explorer at the file's parent folder, with the
-    file selected/highlighted when the platform supports it.
-
-    Item 2 + 3: works even when the JobManager is idle, by using the
-    stored full_path / full_folder_path from the DB.
-    """
+    """Open the OS file explorer at the file's parent folder."""
     rel = (req.relative_path or "").strip()
     if not rel:
         raise HTTPException(400, "relative_path is required")
 
-    rec = db.get_file(rel)
-    if rec is None:
-        raise HTTPException(404, f"File not found in registry: {rel}")
-
-    # Prefer the explicit folder column; fall back to the file's parent.
     full = _resolve_file_path(rel)
-    if rec.full_folder_path:
-        try:
-            parent = Path(rec.full_folder_path).resolve()
-        except OSError:
-            parent = Path(rec.full_folder_path)
-    else:
-        parent = full.parent
+    parent = full.parent
 
     if not parent.exists():
-        # As a last resort, also try the file's parent (might differ if
-        # the stored full_folder_path is stale).
-        if full.parent.exists():
-            parent = full.parent
-        else:
-            raise HTTPException(404, f"Folder not found: {parent}")
+        raise HTTPException(404, f"Folder not found: {parent}")
 
     try:
         if sys.platform.startswith("win"):
             if full.exists():
-                # Open Explorer with the file pre-selected and its folder
-                # showing (item 2). The /select switch DOES open Explorer
-                # at that folder; we just need to make sure we pass the
-                # full file path, not just the folder.
                 import subprocess
-                # NOTE: ", " between /select and the path is intentional —
-                # explorer.exe is finicky about syntax. Both forms work,
-                # but using a single argument is safest.
                 subprocess.Popen(f'explorer /select,"{str(full)}"')
             else:
-                # File is gone; just open the parent folder.
                 os.startfile(str(parent))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             import subprocess
@@ -529,7 +539,6 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError:
-        # Server shutting down. Don't log a noisy traceback for this.
         log.info("WebSocket cancelled (server shutdown).")
     except Exception as e:
         log.warning("WebSocket error: %s", e)

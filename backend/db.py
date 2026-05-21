@@ -1,4 +1,4 @@
-"""SQLite-backed storage for file records and job state.
+"""SQLite-backed storage for file records, repository master data, and job state.
 
 The DB is the canonical source of truth; registry.xlsx is a derived view
 regenerated at checkpoints.
@@ -6,15 +6,27 @@ regenerated at checkpoints.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-from .schemas import FileRecord, KVPair, LLMExtraction, MAX_CUSTOM_PROPERTIES, NamedEntities, now_iso
+from .schemas import (
+    FileRecord,
+    GENERATED_ATTRIBUTE_FIELDS,
+    KVPair,
+    LLMExtraction,
+    MAX_CUSTOM_PROPERTIES,
+    NamedEntities,
+    Repository,
+    now_iso,
+)
 
-SCHEMA_VERSION = 1
+log = logging.getLogger("docregistrar.db")
+
+SCHEMA_VERSION = 2
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -43,6 +55,13 @@ CREATE TABLE IF NOT EXISTS files (
 
 CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
 CREATE INDEX IF NOT EXISTS idx_files_sha ON files(sha256);
+
+CREATE TABLE IF NOT EXISTS repositories (
+    name TEXT PRIMARY KEY,
+    path TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 # Columns added in later schema versions; we ensure they exist via ALTER TABLE
@@ -53,10 +72,12 @@ _LATER_COLUMNS = [
     ("duplicate_group", "TEXT NOT NULL DEFAULT ''"),
     ("indexing_started_at", "TEXT"),
     ("indexing_completed_at", "TEXT"),
-    ("full_path", "TEXT NOT NULL DEFAULT ''"),
-    ("full_folder_path", "TEXT NOT NULL DEFAULT ''"),
     ("relative_folder_path", "TEXT NOT NULL DEFAULT ''"),
 ]
+
+# Columns we no longer use. We try to drop them with SQLite 3.35+'s
+# ALTER TABLE DROP COLUMN. If unavailable / unsupported, we leave them.
+_DEPRECATED_COLUMNS = ["full_path", "full_folder_path"]
 
 
 class Database:
@@ -82,13 +103,58 @@ class Database:
             for col_name, col_def in _LATER_COLUMNS:
                 if col_name not in existing_cols:
                     conn.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_def}")
+
+            # Try to drop deprecated columns (SQLite 3.35+).
+            existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+            for col_name in _DEPRECATED_COLUMNS:
+                if col_name in existing_cols:
+                    try:
+                        conn.execute(f"ALTER TABLE files DROP COLUMN {col_name}")
+                        log.info("Dropped deprecated column files.%s", col_name)
+                    except sqlite3.OperationalError as e:
+                        log.warning(
+                            "Could not drop deprecated column files.%s "
+                            "(SQLite < 3.35?). Leaving as-is. %s",
+                            col_name, e,
+                        )
+
             # Create indexes that depend on migrated columns (safe to repeat)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_dup ON files(is_duplicate)")
+
+            # Seed repositories table from existing extraction_json values
+            # (one-time migration). Path/description are left empty so the
+            # user must edit them before the repo can be used for scanning.
+            existing_repos = {
+                r["name"] for r in conn.execute("SELECT name FROM repositories").fetchall()
+            }
+            distinct_repos = conn.execute(
+                """
+                SELECT DISTINCT COALESCE(json_extract(extraction_json, '$.repository'), '') AS repo
+                  FROM files
+                 WHERE extraction_json IS NOT NULL
+                   AND COALESCE(json_extract(extraction_json, '$.repository'), '') <> ''
+                """
+            ).fetchall()
+            for r in distinct_repos:
+                name = r["repo"]
+                if name and name not in existing_repos:
+                    conn.execute(
+                        "INSERT INTO repositories(name, path, description, created_at) "
+                        "VALUES(?,?,?,?)",
+                        (name, "", "", now_iso()),
+                    )
+                    log.info("Seeded repository from existing data: %r (path empty)", name)
+
             cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
             row = cur.fetchone()
             if row is None:
                 conn.execute(
                     "INSERT INTO meta(key,value) VALUES('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            else:
+                conn.execute(
+                    "UPDATE meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
                 )
 
@@ -116,6 +182,214 @@ class Database:
             row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
             return row["value"] if row else default
 
+    # ---------- repositories (master data) ----------
+
+    def list_repositories(self) -> list[Repository]:
+        """Return all repositories with file counts, sorted alphabetically."""
+        with self.conn() as c:
+            rows = c.execute(
+                """
+                SELECT r.name, r.path, r.description, r.created_at,
+                       COALESCE((
+                         SELECT COUNT(*) FROM files f
+                          WHERE COALESCE(json_extract(f.extraction_json, '$.repository'), '') = r.name
+                       ), 0) AS file_count
+                  FROM repositories r
+                 ORDER BY LOWER(r.name)
+                """
+            ).fetchall()
+            return [
+                Repository(
+                    name=r["name"],
+                    path=r["path"] or "",
+                    description=r["description"] or "",
+                    created_at=r["created_at"],
+                    file_count=int(r["file_count"]),
+                )
+                for r in rows
+            ]
+
+    def get_repository(self, name: str) -> Optional[Repository]:
+        if not name:
+            return None
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT name, path, description, created_at FROM repositories WHERE name=?",
+                (name,),
+            ).fetchone()
+            if row is None:
+                return None
+            cnt_row = c.execute(
+                """SELECT COUNT(*) AS n FROM files
+                    WHERE COALESCE(json_extract(extraction_json, '$.repository'), '') = ?""",
+                (name,),
+            ).fetchone()
+            return Repository(
+                name=row["name"],
+                path=row["path"] or "",
+                description=row["description"] or "",
+                created_at=row["created_at"],
+                file_count=int(cnt_row["n"]) if cnt_row else 0,
+            )
+
+    def create_repository(self, name: str, path: str, description: str = "") -> Repository:
+        name = (name or "").strip()
+        path = (path or "").strip()
+        description = (description or "").strip()
+        if not name:
+            raise ValueError("Repository name is required.")
+        if not path:
+            raise ValueError("Repository path is required.")
+        with self.conn() as c:
+            existing = c.execute(
+                "SELECT 1 FROM repositories WHERE name=?", (name,)
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Repository already exists: {name!r}")
+            ts = now_iso()
+            c.execute(
+                "INSERT INTO repositories(name, path, description, created_at) VALUES(?,?,?,?)",
+                (name, path, description, ts),
+            )
+        rec = self.get_repository(name)
+        assert rec is not None
+        return rec
+
+    def update_repository(self, name: str, *, path: Optional[str] = None,
+                          description: Optional[str] = None) -> Repository:
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM repositories WHERE name=?", (name,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Repository not found: {name!r}")
+            sets: list[str] = []
+            params: list[Any] = []
+            if path is not None:
+                p = (path or "").strip()
+                if not p:
+                    raise ValueError("Repository path cannot be empty.")
+                sets.append("path=?")
+                params.append(p)
+            if description is not None:
+                sets.append("description=?")
+                params.append((description or "").strip())
+            if sets:
+                params.append(name)
+                c.execute(
+                    f"UPDATE repositories SET {', '.join(sets)} WHERE name=?",
+                    params,
+                )
+        rec = self.get_repository(name)
+        assert rec is not None
+        return rec
+
+    def rename_repository(self, old_name: str, new_name: str) -> Repository:
+        """Rename a repository and update all referencing files'
+        extraction_json.repository to the new name.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("New repository name is required.")
+        if old_name == new_name:
+            rec = self.get_repository(old_name)
+            if rec is None:
+                raise ValueError(f"Repository not found: {old_name!r}")
+            return rec
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT path, description, created_at FROM repositories WHERE name=?",
+                (old_name,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Repository not found: {old_name!r}")
+            existing = c.execute(
+                "SELECT 1 FROM repositories WHERE name=?", (new_name,)
+            ).fetchone()
+            if existing:
+                raise ValueError(f"Target repository already exists: {new_name!r}")
+            c.execute(
+                "INSERT INTO repositories(name, path, description, created_at) VALUES(?,?,?,?)",
+                (new_name, row["path"], row["description"], row["created_at"]),
+            )
+            # Update referencing files' extraction_json.repository
+            files = c.execute(
+                """SELECT relative_path, extraction_json FROM files
+                    WHERE COALESCE(json_extract(extraction_json, '$.repository'), '') = ?""",
+                (old_name,),
+            ).fetchall()
+            for f in files:
+                try:
+                    data = json.loads(f["extraction_json"]) if f["extraction_json"] else {}
+                except Exception:
+                    data = {}
+                data["repository"] = new_name
+                try:
+                    ne_obj = NamedEntities(**(data.pop("named_entities", {}) or {}))
+                    new_json = LLMExtraction(named_entities=ne_obj, **data).model_dump_json()
+                except Exception:
+                    new_json = json.dumps({**data, "repository": new_name}, ensure_ascii=False)
+                c.execute(
+                    "UPDATE files SET extraction_json=? WHERE relative_path=?",
+                    (new_json, f["relative_path"]),
+                )
+            c.execute("DELETE FROM repositories WHERE name=?", (old_name,))
+        rec = self.get_repository(new_name)
+        assert rec is not None
+        return rec
+
+    def delete_repository(self, name: str, *, clear_files: bool = True) -> int:
+        """Delete a repository. If clear_files=True, every file referencing
+        this repo gets its extraction_json.repository cleared (set to "").
+        Returns the number of files affected.
+        """
+        with self.conn() as c:
+            row = c.execute("SELECT 1 FROM repositories WHERE name=?", (name,)).fetchone()
+            if row is None:
+                raise ValueError(f"Repository not found: {name!r}")
+            n = 0
+            if clear_files:
+                files = c.execute(
+                    """SELECT relative_path, extraction_json FROM files
+                        WHERE COALESCE(json_extract(extraction_json, '$.repository'), '') = ?""",
+                    (name,),
+                ).fetchall()
+                for f in files:
+                    try:
+                        data = json.loads(f["extraction_json"]) if f["extraction_json"] else {}
+                    except Exception:
+                        data = {}
+                    data["repository"] = ""
+                    try:
+                        ne_obj = NamedEntities(**(data.pop("named_entities", {}) or {}))
+                        new_json = LLMExtraction(named_entities=ne_obj, **data).model_dump_json()
+                    except Exception:
+                        new_json = json.dumps({**data, "repository": ""}, ensure_ascii=False)
+                    c.execute(
+                        "UPDATE files SET extraction_json=? WHERE relative_path=?",
+                        (new_json, f["relative_path"]),
+                    )
+                    n += 1
+            c.execute("DELETE FROM repositories WHERE name=?", (name,))
+        return n
+
+    def repo_path_for_file(self, relative_path: str) -> Optional[str]:
+        """Return the configured path of the repository assigned to this file,
+        or None if the file has no repo OR the repo has no path."""
+        with self.conn() as c:
+            row = c.execute(
+                """SELECT r.path
+                     FROM files f
+                     LEFT JOIN repositories r
+                       ON r.name = COALESCE(json_extract(f.extraction_json, '$.repository'), '')
+                    WHERE f.relative_path=?""",
+                (relative_path,),
+            ).fetchone()
+            if row is None:
+                return None
+            p = row["path"] or ""
+            return p or None
+
     # ---------- files ----------
 
     def upsert_file_basic(
@@ -128,8 +402,6 @@ class Database:
         sha256: str,
         os_created: Optional[str],
         os_modified: Optional[str],
-        full_path: str = "",
-        full_folder_path: str = "",
         relative_folder_path: str = "",
     ) -> str:
         """Insert a new pending row, or update size/sha/dates if file changed.
@@ -138,20 +410,17 @@ class Database:
         """
         with self.conn() as c:
             row = c.execute(
-                "SELECT sha256, status, full_path, full_folder_path, relative_folder_path "
-                "FROM files WHERE relative_path=?",
+                "SELECT sha256, status, relative_folder_path FROM files WHERE relative_path=?",
                 (relative_path,),
             ).fetchone()
             if row is None:
                 c.execute(
                     "INSERT INTO files(relative_path, file_name, extension, file_size, "
-                    "sha256, os_created, os_modified, status, full_path, "
-                    "full_folder_path, relative_folder_path) "
-                    "VALUES(?,?,?,?,?,?,?, 'pending', ?,?,?)",
+                    "sha256, os_created, os_modified, status, relative_folder_path) "
+                    "VALUES(?,?,?,?,?,?,?, 'pending', ?)",
                     (
                         relative_path, file_name, extension, file_size,
-                        sha256, os_created, os_modified, full_path,
-                        full_folder_path, relative_folder_path,
+                        sha256, os_created, os_modified, relative_folder_path,
                     ),
                 )
                 return "pending"
@@ -160,39 +429,52 @@ class Database:
                 # File changed → reset to pending
                 c.execute(
                     "UPDATE files SET file_size=?, sha256=?, os_created=?, os_modified=?, "
-                    "full_path=?, full_folder_path=?, relative_folder_path=?, "
+                    "relative_folder_path=?, "
                     "status='pending', error='', extraction_json=NULL, "
                     "indexed_at=NULL, used_thinking=0 "
                     "WHERE relative_path=?",
                     (
                         file_size, sha256, os_created, os_modified,
-                        full_path, full_folder_path, relative_folder_path,
-                        relative_path,
+                        relative_folder_path, relative_path,
                     ),
                 )
                 return "pending"
 
-            # Unchanged content; refresh path columns if they've drifted
-            # (e.g. a renamed mount point or a registry moved to a new
-            # machine, or older rows that pre-date these columns).
-            updates: list[str] = []
-            params: list[Any] = []
-            if full_path and (row["full_path"] or "") != full_path:
-                updates.append("full_path=?")
-                params.append(full_path)
-            if full_folder_path and (row["full_folder_path"] or "") != full_folder_path:
-                updates.append("full_folder_path=?")
-                params.append(full_folder_path)
+            # Unchanged content; refresh relative_folder_path if drifted.
             if (row["relative_folder_path"] or "") != relative_folder_path:
-                updates.append("relative_folder_path=?")
-                params.append(relative_folder_path)
-            if updates:
-                params.append(relative_path)
                 c.execute(
-                    f"UPDATE files SET {', '.join(updates)} WHERE relative_path=?",
-                    params,
+                    "UPDATE files SET relative_folder_path=? WHERE relative_path=?",
+                    (relative_folder_path, relative_path),
                 )
             return row["status"]
+
+    def assign_repository(self, relative_path: str, repository: str) -> None:
+        """Set extraction_json.repository for a file WITHOUT touching
+        manually_edited (used by the scanner to auto-assign the active repo
+        on freshly ingested files).
+        """
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT extraction_json FROM files WHERE relative_path=?", (relative_path,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                data = json.loads(row["extraction_json"]) if row["extraction_json"] else {}
+            except Exception:
+                data = {}
+            if (data.get("repository") or "") == repository:
+                return
+            data["repository"] = repository
+            try:
+                ne_obj = NamedEntities(**(data.pop("named_entities", {}) or {}))
+                new_json = LLMExtraction(named_entities=ne_obj, **data).model_dump_json()
+            except Exception:
+                new_json = json.dumps({**data, "repository": repository}, ensure_ascii=False)
+            c.execute(
+                "UPDATE files SET extraction_json=? WHERE relative_path=?",
+                (new_json, relative_path),
+            )
 
     def mark_status(self, relative_path: str, status: str, error: str = "") -> None:
         with self.conn() as c:
@@ -233,7 +515,6 @@ class Database:
                 if row is None:
                     continue
                 if row["status"] == "skipped":
-                    # Never auto-flip a skipped file. Record the reason in error.
                     c.execute(
                         "UPDATE files SET error=? WHERE relative_path=?",
                         (skip_msg, p),
@@ -321,7 +602,12 @@ class Database:
 
     def update_fields(self, relative_path: str, fields: dict) -> bool:
         """Edit a single row's fields. `fields` maps from the schema's
-        FileEditRequest fields. Marks row as manually_edited=1.
+        FileEditRequest fields.
+
+        manually_edited is set to 1 ONLY if at least one GENERATED attribute
+        is present in the payload (see GENERATED_ATTRIBUTE_FIELDS). Editing
+        only user-managed fields (repository, source_url_*, custom_properties)
+        does NOT flip the flag.
 
         Special handling:
           - 'status' / 'error' update the dedicated columns.
@@ -340,6 +626,9 @@ class Database:
 
             new_status = fields.pop("status", None)
             new_error = fields.pop("error", None)
+
+            # Determine if any GENERATED attribute is being edited
+            edits_generated = any(k in GENERATED_ATTRIBUTE_FIELDS for k in fields.keys())
 
             # Decode existing extraction_json (or build a fresh empty one)
             ext_data: dict = {}
@@ -389,8 +678,10 @@ class Database:
             except Exception:
                 ext_json = json.dumps(ext_data, ensure_ascii=False)
 
-            sets = ["extraction_json=?", "manually_edited=1"]
+            sets = ["extraction_json=?"]
             params: list[Any] = [ext_json]
+            if edits_generated:
+                sets.append("manually_edited=1")
             if new_status is not None:
                 sets.append("status=?")
                 params.append(new_status)
@@ -398,12 +689,9 @@ class Database:
                 # an explicit re-queue; clear the manual flag so the worker
                 # doesn't immediately skip it.
                 if new_status == "pending":
-                    sets[-2] = "manually_edited=0"
-                    sets.append("extraction_json=NULL")
-                    sets.append("indexed_at=NULL")
-                    sets.append("used_thinking=0")
-                    sets.append("error=''")
-                    params.pop(0)  # remove ext_json arg
+                    sets = ["manually_edited=0", "status=?", "extraction_json=NULL",
+                            "indexed_at=NULL", "used_thinking=0", "error=''"]
+                    params = [new_status]
             if new_error is not None:
                 sets.append("error=?")
                 params.append(new_error)
@@ -418,7 +706,9 @@ class Database:
                  status: Optional[str] = None) -> int:
         """Apply a status and/or repository to many files at once.
 
-        Sets manually_edited=1 on each affected row.
+        Repository-only edits do NOT set manually_edited=1.
+        Status changes set manually_edited=1 (except status='pending', which
+        clears the flag and re-queues).
         Returns number of rows affected.
         """
         n = 0
@@ -446,8 +736,9 @@ class Database:
                         ext_json = LLMExtraction(named_entities=ne_obj, **clean_top).model_dump_json()
                     except Exception:
                         ext_json = json.dumps(ext_data, ensure_ascii=False)
+                    # Repository-only assignment: do NOT touch manually_edited.
                     c.execute(
-                        "UPDATE files SET extraction_json=?, manually_edited=1 WHERE relative_path=?",
+                        "UPDATE files SET extraction_json=? WHERE relative_path=?",
                         (ext_json, p),
                     )
 
@@ -474,21 +765,16 @@ class Database:
         """Return the next file the worker should process.
 
         Priority:
-          1. status='pending' rows (newest scan / explicit re-eval)
-          2. then status='error' rows (so transient failures get re-tried
-             once the pending queue is drained — items 5 in the spec)
-        Files in 'skipped' status are NEVER returned (item 5).
-        Files in 'done' or 'processing' are obviously not eligible either.
+          1. status='pending' rows
+          2. then status='error' rows
         """
         with self.conn() as c:
-            # First: pending
             row = c.execute(
                 "SELECT * FROM files WHERE status='pending' "
                 "ORDER BY relative_path LIMIT 1"
             ).fetchone()
             if row is not None:
                 return _row_to_record(row)
-            # Then: error rows
             row = c.execute(
                 "SELECT * FROM files WHERE status='error' "
                 "ORDER BY relative_path LIMIT 1"
@@ -496,11 +782,7 @@ class Database:
             return _row_to_record(row) if row else None
 
     def find_done_sibling(self, sha256: str, exclude_relative_path: str) -> Optional[FileRecord]:
-        """Return any other file with the same SHA-256 that's already 'done'.
-
-        Used to short-circuit LLM extraction when a byte-identical sibling
-        was already processed (item 1).
-        """
+        """Return any other file with the same SHA-256 that's already 'done'."""
         if not sha256:
             return None
         with self.conn() as c:
@@ -519,18 +801,7 @@ class Database:
         *,
         default_repository: str = "",
     ) -> bool:
-        """Copy `extraction_json` and `page_count` from one row to another.
-
-        Sets target's status='done', clears error, fills indexed_at and
-        indexing_started_at/indexing_completed_at to 'now', leaves
-        manually_edited=0 and used_thinking=0. The target keeps its own
-        relative_path / file_name / sha256 / etc.
-
-        If `default_repository` is non-empty AND the copied extraction has
-        no repository set, the default is filled in.
-
-        Returns True on success.
-        """
+        """Copy `extraction_json` and `page_count` from one row to another."""
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -551,13 +822,11 @@ class Database:
             if default_repository and not (ext_data.get("repository") or ""):
                 ext_data["repository"] = default_repository
 
-            # Re-validate via Pydantic to keep a consistent shape
             try:
                 ne_obj = NamedEntities(**(ext_data.pop("named_entities", {}) or {}))
                 extraction = LLMExtraction(named_entities=ne_obj, **ext_data)
                 ext_json = extraction.model_dump_json()
             except Exception:
-                # Fall back to raw JSON if validation fails
                 ext_json = src["extraction_json"]
 
             cur = c.execute(
@@ -600,13 +869,7 @@ class Database:
         `repository` semantics:
           - `None` (default): no repository filter, return all rows.
           - `""`            : return only rows whose repository is empty
-                              (i.e. extraction.repository is "" or NULL/missing).
           - `"X"`           : return only rows whose extraction.repository == "X".
-
-        The repository value lives inside extraction_json, so we use
-        `json_extract` to filter on it. SQLite's json1 extension is
-        available by default in modern SQLite builds (and certainly in
-        the Python standard library since 3.9).
         """
         sql = "SELECT * FROM files"
         clauses = []
@@ -625,8 +888,6 @@ class Database:
             clauses.append("is_duplicate=1")
         if repository is not None:
             if repository == "":
-                # Empty repo filter: rows with no extraction yet, or with
-                # an explicitly-empty repository inside extraction_json.
                 clauses.append(
                     "(extraction_json IS NULL "
                     "OR COALESCE(json_extract(extraction_json, '$.repository'), '') = '')"
@@ -661,15 +922,9 @@ class Database:
             return [_row_to_record(r) for r in rows]
 
     def recompute_duplicates(self) -> int:
-        """One-pass authoritative recompute of is_duplicate / duplicate_group
-        for every row. Returns the number of duplicate groups (size >= 2).
-        """
+        """One-pass authoritative recompute of is_duplicate / duplicate_group."""
         with self.conn() as c:
-            c.execute("""
-                UPDATE files
-                   SET is_duplicate = 0,
-                       duplicate_group = ''
-            """)
+            c.execute("UPDATE files SET is_duplicate = 0, duplicate_group = ''")
             c.execute("""
                 UPDATE files
                    SET is_duplicate = 1,
@@ -691,12 +946,11 @@ class Database:
 
     def skip_dup_siblings_of(self, relative_paths: Iterable[str]) -> int:
         """For every SHA-256 in the given selection, mark every OTHER file
-        with the same SHA-256 as 'skipped'. The selected files themselves
-        are NOT touched. Returns number of rows updated.
-        """
+        with the same SHA-256 as 'skipped'."""
         with self.conn() as c:
             shas = set()
-            for p in relative_paths:
+            rp_list = list(relative_paths)
+            for p in rp_list:
                 row = c.execute(
                     "SELECT sha256 FROM files WHERE relative_path=?", (p,)
                 ).fetchone()
@@ -704,11 +958,11 @@ class Database:
                     shas.add(row["sha256"])
             if not shas:
                 return 0
-            placeholders = ",".join("?" for _ in relative_paths)
+            placeholders = ",".join("?" for _ in rp_list)
             sha_placeholders = ",".join("?" for _ in shas)
             params: list[Any] = []
             params.extend(shas)
-            params.extend(relative_paths)
+            params.extend(rp_list)
             cur = c.execute(
                 f"""UPDATE files
                        SET status='skipped', manually_edited=1
@@ -737,28 +991,6 @@ class Database:
             row = c.execute("SELECT COUNT(*) AS n FROM files").fetchone()
             return int(row["n"]) if row else 0
 
-    def list_repositories(self) -> list[dict]:
-        """Return all distinct, non-empty Repository values used across the
-        registry, with a per-repository usage count.
-
-        Used by the UI's "Browse repositories" picker so the user can
-        discover which Repository values are already in use rather than
-        re-typing them. Sorted alphabetically (case-insensitive).
-        """
-        with self.conn() as c:
-            rows = c.execute(
-                """
-                SELECT COALESCE(json_extract(extraction_json, '$.repository'), '') AS repo,
-                       COUNT(*) AS n
-                  FROM files
-                 WHERE extraction_json IS NOT NULL
-                   AND COALESCE(json_extract(extraction_json, '$.repository'), '') <> ''
-                 GROUP BY repo
-                 ORDER BY LOWER(repo)
-                """
-            ).fetchall()
-            return [{"repository": r["repo"], "count": int(r["n"])} for r in rows]
-
     def delete_files_not_in(self, present_paths: set[str]) -> int:
         """Remove DB rows for files no longer on disk."""
         if not present_paths:
@@ -775,15 +1007,32 @@ class Database:
                 n += 1
             return n
 
-    def delete_files(self, relative_paths: Iterable[str]) -> int:
-        """Permanently remove the given rows from the registry.
-
-        This does NOT touch the underlying file on disk. If the file is
-        still present and the containing folder is scanned again, the
-        file will be re-discovered and re-added as a fresh 'pending' row.
-
-        Returns the number of rows actually deleted.
+    def delete_files_not_in_repo(self, repository: str, present_paths: set[str]) -> int:
+        """Like delete_files_not_in, but limited to files belonging to the
+        given repository. Used by the scanner so it doesn't delete files
+        from other repos. `present_paths` are relative_paths (relative to
+        the repo root) that are still present on disk.
         """
+        if not repository:
+            return 0
+        with self.conn() as c:
+            existing = {
+                r["relative_path"]
+                for r in c.execute(
+                    """SELECT relative_path FROM files
+                        WHERE COALESCE(json_extract(extraction_json, '$.repository'), '') = ?""",
+                    (repository,),
+                ).fetchall()
+            }
+            stale = existing - present_paths
+            n = 0
+            for p in stale:
+                c.execute("DELETE FROM files WHERE relative_path=?", (p,))
+                n += 1
+            return n
+
+    def delete_files(self, relative_paths: Iterable[str]) -> int:
+        """Permanently remove the given rows from the registry."""
         n = 0
         with self.conn() as c:
             for p in relative_paths:
@@ -791,9 +1040,6 @@ class Database:
                     continue
                 cur = c.execute("DELETE FROM files WHERE relative_path=?", (p,))
                 n += cur.rowcount
-            # Recompute duplicate flags after a delete: removing one of two
-            # twins should clear is_duplicate=1 on the survivor. (Cheap
-            # because there's an index on sha256.)
             if n > 0:
                 c.execute("UPDATE files SET is_duplicate = 0, duplicate_group = ''")
                 c.execute(
@@ -831,8 +1077,6 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
 
     return FileRecord(
         relative_path=row["relative_path"],
-        full_path=_opt("full_path", "") or "",
-        full_folder_path=_opt("full_folder_path", "") or "",
         relative_folder_path=_opt("relative_folder_path", "") or "",
         file_name=row["file_name"],
         extension=row["extension"],

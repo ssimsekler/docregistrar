@@ -29,7 +29,6 @@ async function api(method, path, body) {
   return r.json();
 }
 
-// Field configs for the editor
 const STRING_FIELDS = [
   ["title", "Title"],
   ["document_type", "Document type"],
@@ -59,8 +58,8 @@ const LIST_FIELDS = [
 ];
 
 const STATUS_OPTIONS = ["pending", "done", "error", "skipped"];
+const MAX_CUSTOM_PROPERTIES = 50;
 
-// ---------- small components ----------
 function PropRow({ label, value }) {
   if (value === undefined || value === null || value === "" ||
       (Array.isArray(value) && value.length === 0)) {
@@ -104,35 +103,38 @@ function stringToList(s) {
   return (s || "").split(";").map(x => x.trim()).filter(Boolean);
 }
 
-const MAX_CUSTOM_PROPERTIES = 50;
-
-// ---------- Repository picker dialog ----------
-// Modal that lists every distinct Repository value already in use, with a
-// usage count, plus a "(no repository)" entry to clear the field. The
-// user can also type a free-text search to filter the list.
-//
-// The user is NOT forced to pick from this list — they may still type a
-// brand-new Repository value into the header input.
-function RepositoryPickerDialog({ open, onPick, onClose }) {
-  const [items, setItems] = useState([]);   // [{repository, count}]
+// ---------- Repository management dialog ----------
+// Full master-data CRUD UI: list, edit (path/description), rename, delete,
+// and create new repositories. Picking a row (clicking the row body but
+// NOT a button or input) selects that repository for the header.
+function RepositoryManagerDialog({ open, onPick, onClose, currentSelection, onChanged }) {
+  const [items, setItems] = useState([]);
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
+  // Edit drafts keyed by repo name
+  const [edits, setEdits] = useState({});  // { name: { path, description } }
+  // New-repo form
+  const [newName, setNewName] = useState("");
+  const [newPath, setNewPath] = useState("");
+  const [newDesc, setNewDesc] = useState("");
 
-  // Refresh the list every time the dialog is opened so it always
-  // reflects the current state of the registry.
+  const refresh = useCallback(async () => {
+    setLoading(true); setErr("");
+    try {
+      const r = await api("GET", "/api/repositories");
+      setItems(Array.isArray(r.items) ? r.items : []);
+      setEdits({});
+    } catch (e) { setErr(e.message); setItems([]); }
+    finally { setLoading(false); }
+  }, []);
+
   useEffect(() => {
     if (!open) return;
-    let aborted = false;
-    setLoading(true); setErr(""); setFilter("");
-    api("GET", "/api/repositories")
-      .then(r => { if (!aborted) setItems(Array.isArray(r.items) ? r.items : []); })
-      .catch(e => { if (!aborted) { setErr(e.message); setItems([]); } })
-      .finally(() => { if (!aborted) setLoading(false); });
-    return () => { aborted = true; };
-  }, [open]);
+    refresh();
+    setFilter(""); setNewName(""); setNewPath(""); setNewDesc("");
+  }, [open, refresh]);
 
-  // Close on Escape for keyboard friendliness.
   useEffect(() => {
     if (!open) return;
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
@@ -144,60 +146,227 @@ function RepositoryPickerDialog({ open, onPick, onClose }) {
 
   const f = filter.trim().toLowerCase();
   const filtered = !f ? items
-    : items.filter(it => (it.repository || "").toLowerCase().includes(f));
+    : items.filter(it => (it.name || "").toLowerCase().includes(f)
+                      || (it.path || "").toLowerCase().includes(f)
+                      || (it.description || "").toLowerCase().includes(f));
+
+  const startEdit = (rec) => {
+    setEdits(prev => ({
+      ...prev,
+      [rec.name]: { path: rec.path || "", description: rec.description || "" },
+    }));
+  };
+  const cancelEdit = (name) => {
+    setEdits(prev => {
+      const c = { ...prev }; delete c[name]; return c;
+    });
+  };
+  const updateEditField = (name, key, value) => {
+    setEdits(prev => ({
+      ...prev,
+      [name]: { ...(prev[name] || {}), [key]: value },
+    }));
+  };
+  const saveEdit = async (rec) => {
+    const e = edits[rec.name];
+    if (!e) return;
+    if (!e.path || !e.path.trim()) {
+      alert("Path is required.");
+      return;
+    }
+    try {
+      await api("PATCH", `/api/repositories/${encodeURIComponent(rec.name)}`, {
+        path: e.path,
+        description: e.description ?? "",
+      });
+      await refresh();
+      onChanged && onChanged();
+    } catch (err) { alert(err.message); }
+  };
+  const renameRepo = async (rec) => {
+    const next = prompt(`Rename repository "${rec.name}" to:`, rec.name);
+    if (!next || next === rec.name) return;
+    try {
+      await api("POST", `/api/repositories/${encodeURIComponent(rec.name)}/rename`, {
+        new_name: next,
+      });
+      await refresh();
+      onChanged && onChanged(rec.name, next);
+    } catch (err) { alert(err.message); }
+  };
+  const deleteRepo = async (rec) => {
+    const msg = rec.file_count > 0
+      ? `Delete repository "${rec.name}"?\n\n` +
+        `${rec.file_count} file(s) currently reference this repository. ` +
+        `Their Repository field will be cleared (files themselves will not be removed).\n\n` +
+        `Proceed?`
+      : `Delete repository "${rec.name}"?`;
+    if (!confirm(msg)) return;
+    try {
+      await api("DELETE", `/api/repositories/${encodeURIComponent(rec.name)}`);
+      await refresh();
+      onChanged && onChanged(rec.name, null);
+    } catch (err) { alert(err.message); }
+  };
+  const createRepo = async () => {
+    if (!newName.trim() || !newPath.trim()) {
+      alert("Name and Path are required.");
+      return;
+    }
+    try {
+      await api("POST", "/api/repositories", {
+        name: newName.trim(),
+        path: newPath.trim(),
+        description: newDesc.trim(),
+      });
+      setNewName(""); setNewPath(""); setNewDesc("");
+      await refresh();
+      onChanged && onChanged();
+    } catch (err) { alert(err.message); }
+  };
+  const pickFolder = async (cb) => {
+    try {
+      const r = await api("POST", "/api/pick-folder");
+      if (r.path) cb(r.path);
+    } catch (err) { alert(err.message); }
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()}>
+      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
         <div className="modal-head">
-          <h3>🔎 Browse repositories</h3>
+          <h3>📁 Repositories (master data)</h3>
           <button className="modal-close" onClick={onClose} title="Close (Esc)">✕</button>
         </div>
         <div className="modal-body">
           <input
             className="modal-search"
             type="text"
-            placeholder="Filter…"
+            placeholder="Filter by name, path or description…"
             value={filter}
             onChange={e => setFilter(e.target.value)}
             autoFocus
-            title="Type to filter the list of known repositories"
           />
+
+          {/* Add new repository */}
+          <div className="repo-add-row">
+            <input
+              type="text" placeholder="New repository name"
+              value={newName} onChange={e => setNewName(e.target.value)}
+              title="Unique name for the new repository (required)"
+            />
+            <input
+              type="text" placeholder="Folder path (required)"
+              value={newPath} onChange={e => setNewPath(e.target.value)}
+              title="Absolute folder path for this repository (required)"
+            />
+            <button onClick={() => pickFolder(setNewPath)} title="Browse for folder">📂</button>
+            <input
+              type="text" placeholder="Description (optional)"
+              value={newDesc} onChange={e => setNewDesc(e.target.value)}
+              style={{ minWidth: 160 }}
+              title="Free-form description"
+            />
+            <button className="primary" onClick={createRepo}
+                    title="Create the new repository">➕ Add</button>
+          </div>
+
           {loading && <div className="repo-empty">Loading…</div>}
           {err && <div className="error-text">Error: {err}</div>}
+
           {!loading && !err && (
-            <div className="repo-list">
-              {/* Always offer the "no repository" choice — handy when the
-                  user wants to clear the filter and see un-tagged files. */}
-              <div className="repo-row no-repo"
-                   onClick={() => onPick("")}
-                   title="Pick this to clear the Repository field (and show only files without a Repository in the grid)">
-                <span className="repo-name">(no repository)</span>
-                <span className="repo-count"></span>
-              </div>
-              {filtered.map(it => (
-                <div className="repo-row" key={it.repository}
-                     onClick={() => onPick(it.repository)}
-                     title={`Use Repository: ${it.repository} (${it.count} file${it.count === 1 ? "" : "s"})`}>
-                  <span className="repo-name">{it.repository}</span>
-                  <span className="repo-count">{it.count}</span>
-                </div>
-              ))}
-              {filtered.length === 0 && (
-                <div className="repo-empty">
-                  {items.length === 0
-                    ? "No repositories found yet. Tag some files (via Apply repo or bulk-edit) and they'll show up here."
-                    : "No matches for that filter."}
-                </div>
-              )}
+            <div style={{ overflow: "auto", border: "1px solid var(--border)", borderRadius: 6 }}>
+              <table className="repo-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Path</th>
+                    <th>Description</th>
+                    <th title="Number of files referencing this repository">Files</th>
+                    <th>Created</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(rec => {
+                    const editing = !!edits[rec.name];
+                    const e = edits[rec.name] || {};
+                    const selected = currentSelection === rec.name;
+                    return (
+                      <tr key={rec.name} className={selected ? "selected-repo" : ""}>
+                        <td>
+                          <div style={{ fontWeight: 600 }}>{rec.name}</div>
+                          {selected && <div className="muted" style={{ fontSize: 11 }}>(selected)</div>}
+                        </td>
+                        <td style={{ minWidth: 200 }}>
+                          {editing ? (
+                            <div style={{ display: "flex", gap: 4 }}>
+                              <input type="text" value={e.path || ""}
+                                     onChange={ev => updateEditField(rec.name, "path", ev.target.value)}
+                                     placeholder="Path (required)" />
+                              <button onClick={() => pickFolder(p => updateEditField(rec.name, "path", p))}
+                                      title="Browse">📂</button>
+                            </div>
+                          ) : (
+                            rec.path
+                              ? <span style={{ fontFamily: "ui-monospace,Menlo,Consolas,monospace", fontSize: 11 }}>{rec.path}</span>
+                              : <span className="repo-pill-empty">no path set — click ✎ to add one</span>
+                          )}
+                        </td>
+                        <td style={{ minWidth: 160 }}>
+                          {editing ? (
+                            <input type="text" value={e.description || ""}
+                                   onChange={ev => updateEditField(rec.name, "description", ev.target.value)}
+                                   placeholder="Description" />
+                          ) : (
+                            rec.description || <span className="muted">—</span>
+                          )}
+                        </td>
+                        <td>{rec.file_count}</td>
+                        <td><span className="muted" style={{ fontSize: 11 }}>{rec.created_at}</span></td>
+                        <td>
+                          <div className="repo-actions">
+                            {!editing && (
+                              <>
+                                <button onClick={() => onPick && onPick(rec.name)}
+                                        title="Select this repository for the header (will be used by Start)">
+                                  ✓ Select
+                                </button>
+                                <button onClick={() => startEdit(rec)} title="Edit path/description">✎</button>
+                                <button onClick={() => renameRepo(rec)} title="Rename this repository">📝</button>
+                                <button className="danger" onClick={() => deleteRepo(rec)}
+                                        title="Delete this repository (referencing files will have their Repository cleared)">🗑</button>
+                              </>
+                            )}
+                            {editing && (
+                              <>
+                                <button className="primary" onClick={() => saveEdit(rec)}
+                                        title="Save changes">💾</button>
+                                <button onClick={() => cancelEdit(rec.name)} title="Cancel">✕</button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {filtered.length === 0 && (
+                    <tr><td colSpan={6} className="repo-empty">
+                      {items.length === 0
+                        ? "No repositories yet. Use the form above to create one."
+                        : "No matches for that filter."}
+                    </td></tr>
+                  )}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
         <div className="modal-foot">
-          <span className="muted" style={{ marginRight: "auto", fontSize: "12px" }}>
-            Tip: you can also just type a brand-new Repository name into the field.
+          <span className="muted" style={{ marginRight: "auto", fontSize: 12 }}>
+            Tip: a repository's <b>Path</b> is required. It is used both to scan files when you press Start, and to open files later.
           </span>
-          <button onClick={onClose} title="Close without changing the Repository">Cancel</button>
+          <button onClick={onClose} title="Close">Close</button>
         </div>
       </div>
     </div>
@@ -210,10 +379,8 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({});
-  // Custom properties are edited independently of the main "Edit" mode
-  const [kv, setKv] = useState([]);                 // [{key, value}]
+  const [kv, setKv] = useState([]);
   const [kvSavingHint, setKvSavingHint] = useState("");
-  // Duplicate siblings (other files with the same SHA-256)
   const [siblings, setSiblings] = useState([]);
 
   const isCurrent = currentProgress && currentProgress.relative_path === relativePath;
@@ -224,7 +391,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
     try {
       const r = await api("GET", `/api/file?relative_path=${encodeURIComponent(relativePath)}`);
       setRec(r);
-      // Initialize the draft from the loaded record
       const e = r.extraction || {};
       const ne = e.named_entities || {};
       setDraft({
@@ -255,7 +421,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
         products_technologies: listToString(ne.products_technologies),
         status: r.status,
       });
-      // Custom properties (independent edit)
       const cp = Array.isArray(e.custom_properties) ? e.custom_properties : [];
       setKv(cp.map(p => ({ key: p.key || "", value: p.value || "" })));
       setKvSavingHint("");
@@ -263,17 +428,10 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
     finally { setLoading(false); }
   }, [relativePath]);
 
-  const addKv = () => {
-    setKv(prev => prev.length >= MAX_CUSTOM_PROPERTIES ? prev : [...prev, { key: "", value: "" }]);
-  };
-  const updateKv = (i, field, val) => {
-    setKv(prev => prev.map((p, idx) => idx === i ? { ...p, [field]: val } : p));
-  };
-  const removeKv = (i) => {
-    setKv(prev => prev.filter((_, idx) => idx !== i));
-  };
+  const addKv = () => setKv(prev => prev.length >= MAX_CUSTOM_PROPERTIES ? prev : [...prev, { key: "", value: "" }]);
+  const updateKv = (i, field, val) => setKv(prev => prev.map((p, idx) => idx === i ? { ...p, [field]: val } : p));
+  const removeKv = (i) => setKv(prev => prev.filter((_, idx) => idx !== i));
   const saveKv = async () => {
-    // Trim and drop fully-empty rows
     const cleaned = kv
       .map(p => ({ key: (p.key || "").trim(), value: (p.value || "").trim() }))
       .filter(p => p.key || p.value)
@@ -289,7 +447,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
 
   useEffect(() => { load(); }, [load]);
 
-  // Load duplicate siblings whenever the record changes
   useEffect(() => {
     let aborted = false;
     if (!rec || !rec.is_duplicate) {
@@ -302,7 +459,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
     return () => { aborted = true; };
   }, [rec, relativePath]);
 
-  // Auto-refresh while file is being processed (only when not editing)
   useEffect(() => {
     if (!isCurrent || editing) return;
     const id = setInterval(load, 1500);
@@ -312,7 +468,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
   const setField = (k, v) => setDraft(prev => ({ ...prev, [k]: v }));
 
   const saveEdits = async () => {
-    // Build payload: only fields that changed from rec
     const e = rec.extraction || {};
     const ne = e.named_entities || {};
     const payload = {};
@@ -340,17 +495,11 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
     if (cmpList(ne.dates, draft.mentioned_dates))       payload.mentioned_dates = stringToList(draft.mentioned_dates);
     if (cmpList(ne.products_technologies, draft.products_technologies)) payload.products_technologies = stringToList(draft.products_technologies);
 
-    // Description (own card)
     if (cmp(e.description ?? "", draft.description)) {
-      // Hard-cap at 250 chars defensively
       const d = (draft.description || "").slice(0, DESCRIPTION_MAX);
       payload.description = d;
     }
-
-    // Summary
     if (cmp(e.summary ?? "", draft.summary)) payload.summary = draft.summary;
-
-    // Status (always send if changed)
     if (draft.status && draft.status !== rec.status) payload.status = draft.status;
 
     if (Object.keys(payload).length === 0) {
@@ -379,12 +528,9 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
           <div className="detail-path muted">{relativePath}</div>
         </div>
         <div className="detail-actions">
-          {!editing && <button onClick={() => setEditing(true)}
-                               title="Enter edit mode for the LLM-produced fields, status, and named entities">✎ Edit</button>}
-          {editing && <button className="primary" onClick={saveEdits}
-                              title="Save edits and exit edit mode">💾 Save</button>}
-          {editing && <button onClick={() => { setEditing(false); load(); }}
-                              title="Discard edits and reload the saved values">Cancel</button>}
+          {!editing && <button onClick={() => setEditing(true)} title="Edit fields">✎ Edit</button>}
+          {editing && <button className="primary" onClick={saveEdits} title="Save edits">💾 Save</button>}
+          {editing && <button onClick={() => { setEditing(false); load(); }} title="Cancel">Cancel</button>}
           {!editing && <button
               onClick={async () => {
                 try {
@@ -393,20 +539,16 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                   alert(`Could not open file location:\n${err.message}`);
                 }
               }}
-              title="Open the OS file explorer at this file's folder (file will be highlighted on Windows/macOS)">
+              title="Open the OS file explorer at this file's folder">
             📁 Open location
           </button>}
-          {!editing && <button onClick={() => onReevaluate(relativePath, false)}
-                               title="Queue this file for re-evaluation by the LLM (skipped if manually edited)">↻ Re-eval</button>}
-          {!editing && <button onClick={() => onReevaluate(relativePath, true)}
-                               title="Re-evaluate using the model's slower 'thinking' mode for higher quality">↻ + 🧠</button>}
+          {!editing && <button onClick={() => onReevaluate(relativePath, false)} title="Re-evaluate">↻ Re-eval</button>}
+          {!editing && <button onClick={() => onReevaluate(relativePath, true)} title="Re-evaluate with thinking">↻ + 🧠</button>}
           {!editing && <button className="danger"
               onClick={async () => {
                 if (!confirm(
                   `Remove this file from the registry?\n\n${relativePath}\n\n` +
-                  `The file on disk is NOT deleted. If you re-scan the containing ` +
-                  `folder, this file will be re-discovered and added back as a fresh ` +
-                  `'pending' entry.`
+                  `The file on disk is NOT deleted.`
                 )) return;
                 try {
                   await api("POST", "/api/files/delete", { relative_paths: [relativePath] });
@@ -415,12 +557,11 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                   alert(`Could not remove from registry:\n${err.message}`);
                 }
               }}
-              title="Remove this file from the registry. The file on disk is NOT deleted; rescan the folder to re-add it as a fresh entry.">
+              title="Remove from registry">
             🗑 Remove
           </button>}
-          <button onClick={load}
-                  title="Reload this file's data from the server (useful after external changes)">🔄</button>
-          <button onClick={onClose} title="Close this details panel and show the activity log">✕</button>
+          <button onClick={load} title="Reload">🔄</button>
+          <button onClick={onClose} title="Close">✕</button>
         </div>
       </div>
 
@@ -429,7 +570,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
 
       {rec && (
         <div className="detail-body">
-          {/* Live processing block */}
           {isCurrent && currentProgress && !editing && (
             <div className="card live">
               <div className="card-title">
@@ -471,9 +611,9 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             <PropRow label="Status" value={rec.status} />
             )}
             <PropRow label="Error" value={rec.error} />
-            <PropRow label="Full path" value={rec.full_path} />
-            <PropRow label="Full folder path" value={rec.full_folder_path} />
-            <PropRow label="Relative folder path" value={rec.relative_folder_path} />
+            <PropRow label="Repository path" value={rec.repository_path} />
+            <PropRow label="Relative path" value={rec.relative_folder_path} />
+            <PropRow label="File name" value={rec.file_name} />
             <PropRow label="Size" value={fmtBytes(rec.file_size)} />
             <PropRow label="Pages / slides" value={rec.page_count} />
             <PropRow label="Extension" value={rec.extension} />
@@ -488,17 +628,13 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             <PropRow label="Is duplicate" value={rec.is_duplicate ? "Yes" : "No"} />
           </div>
 
-          {/* Duplicates card (only if this file has siblings sharing its SHA-256) */}
           {rec.is_duplicate && (
             <div className="card">
-              <div className="card-title"
-                   title="Other files with byte-identical content (same SHA-256). Click a row to open it.">
+              <div className="card-title">
                 🟰 Duplicates ({siblings.length} other file{siblings.length === 1 ? "" : "s"} with the same SHA-256)
               </div>
               {siblings.length === 0 && (
-                <div className="muted" style={{ fontSize: "12px" }}>
-                  Loading siblings…
-                </div>
+                <div className="muted" style={{ fontSize: "12px" }}>Loading siblings…</div>
               )}
               <div className="dup-sibs">
                 {siblings.slice(0, 20).map(s => (
@@ -512,14 +648,13 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                 ))}
                 {siblings.length > 20 && (
                   <div className="muted" style={{ fontSize: "11px", padding: "4px 6px" }}>
-                    … and {siblings.length - 20} more (use "Filter by SHA-256" in the toolbar to see them all)
+                    … and {siblings.length - 20} more
                   </div>
                 )}
               </div>
             </div>
           )}
 
-          {/* Extracted properties */}
           <div className="card">
             <div className="card-title">Extracted properties {editing && "(editable)"}</div>
             {STRING_FIELDS.map(([k, label]) => (
@@ -536,10 +671,7 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
           </div>
 
           <div className="card">
-            <div className="card-title"
-                 title={`A short factual gist of the document (max ${DESCRIPTION_MAX} chars). Distinct from Summary.`}>
-              Description {editing && `(editable, max ${DESCRIPTION_MAX} chars)`}
-            </div>
+            <div className="card-title">Description {editing && `(editable, max ${DESCRIPTION_MAX} chars)`}</div>
             {editing ? (
               <div className="prop-row">
                 <div className="prop-label">Description</div>
@@ -549,7 +681,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                     onChange={ev => setField("description", ev.target.value.slice(0, DESCRIPTION_MAX))}
                     rows={3}
                     style={{ width: "100%" }}
-                    title={`Up to ${DESCRIPTION_MAX} chars. Auto-trimmed.`}
                   />
                   <div className="muted" style={{ fontSize: "11px", textAlign: "right" }}>
                     {(draft.description || "").length} / {DESCRIPTION_MAX}
@@ -569,7 +700,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             }
           </div>
 
-          {/* Lists (named entities + topics) */}
           <div className="card">
             <div className="card-title">Lists {editing && "(use ; to separate items)"}</div>
             {LIST_FIELDS.map(([k, label]) => {
@@ -587,9 +717,8 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             })}
           </div>
 
-          {/* Custom properties (independent of Edit mode) */}
           <div className="card">
-            <div className="card-title" title="User-defined key/value pairs. Saved per file. Included in the Excel export.">
+            <div className="card-title">
               Custom properties ({kv.length}/{MAX_CUSTOM_PROPERTIES})
             </div>
             <div className="kv-list">
@@ -600,23 +729,15 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               )}
               {kv.map((p, i) => (
                 <div className="kv-row" key={i}>
-                  <input
-                    className="kv-key"
-                    type="text"
-                    placeholder="key"
+                  <input className="kv-key" type="text" placeholder="key"
                     value={p.key}
                     onChange={ev => updateKv(i, "key", ev.target.value)}
-                    title="Property key (free text)"
                   />
-                  <input
-                    type="text"
-                    placeholder="value"
+                  <input type="text" placeholder="value"
                     value={p.value}
                     onChange={ev => updateKv(i, "value", ev.target.value)}
-                    title="Property value (free text)"
                   />
-                  <button className="kv-remove" onClick={() => removeKv(i)}
-                          title="Remove this key/value pair">🗑</button>
+                  <button className="kv-remove" onClick={() => removeKv(i)} title="Remove">🗑</button>
                 </div>
               ))}
             </div>
@@ -628,10 +749,7 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                         : "Add a new custom property row"}>
                 ➕ Add property
               </button>
-              <button className="primary" onClick={saveKv}
-                      title="Save custom properties to this file (writes to local DB and to registry.xlsx on next checkpoint)">
-                💾 Save custom
-              </button>
+              <button className="primary" onClick={saveKv} title="Save custom properties">💾 Save custom</button>
               {kvSavingHint && <span className="kv-status">{kvSavingHint}</span>}
               <span className="kv-status muted" style={{ marginLeft: "auto" }}>
                 Excel format: <code>k1: v1 | k2: v2 | …</code>
@@ -648,31 +766,30 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
 function App() {
   const [config, setConfig] = useState(null);
   const [progress, setProgress] = useState({
-    state: "idle", target_folder: "",
+    state: "idle", target_folder: "", repository: "",
     total: 0, done: 0, error: 0, skipped: 0, pending: 0, processing: 0,
     current_file: "", last_message: "", started_at: null,
     current_file_progress: null,
   });
-  const [folder, setFolder] = useState("");
+  // The currently-selected repository (drives Start + grid filter).
   const [repository, setRepository] = useState("");
+  // Cached repositories list (so we can show the selected repo's path inline)
+  const [repositoriesCache, setRepositoriesCache] = useState([]);
   const [files, setFiles] = useState([]);
   const [statusFilter, setStatusFilter] = useState("");
   const [search, setSearch] = useState("");
-  const [shaFilter, setShaFilter] = useState("");      // exact-match SHA-256 filter
-  const [dupOnly, setDupOnly] = useState(false);       // show only duplicates
+  const [shaFilter, setShaFilter] = useState("");
+  const [dupOnly, setDupOnly] = useState(false);
   const [selected, setSelected] = useState(new Set());
   const [logLines, setLogLines] = useState([]);
   const [useThinking, setUseThinking] = useState(false);
   const [verbosity, setVerbosity] = useState("normal");
   const [openedPath, setOpenedPath] = useState("");
   const [tick, setTick] = useState(0);
-  // Bulk-edit input states
   const [bulkRepo, setBulkRepo] = useState("");
   const [bulkStatus, setBulkStatus] = useState("");
-  // Repository picker dialog open state (header) and bulk-edit picker
-  const [repoPickerOpen, setRepoPickerOpen] = useState(false);
-  const [bulkRepoPickerOpen, setBulkRepoPickerOpen] = useState(false);
-  // Right-panel width (resizable, persisted)
+  const [repoMgrOpen, setRepoMgrOpen] = useState(false);
+  const [bulkRepoMgrOpen, setBulkRepoMgrOpen] = useState(false);
   const [rightWidth, setRightWidth] = useState(() => {
     const saved = parseInt(localStorage.getItem("docregistrar.rightWidth") || "", 10);
     if (!Number.isNaN(saved) && saved >= 280 && saved <= 1600) return saved;
@@ -683,7 +800,27 @@ function App() {
   const verbosityRef = useRef(verbosity);
   useEffect(() => { verbosityRef.current = verbosity; }, [verbosity]);
 
-  // Splitter drag handlers (mouse on whole window so pointer can leave splitter)
+  // The selected repository as an object (or null), pulled from the cache.
+  const selectedRepoObj = useMemo(
+    () => repositoriesCache.find(r => r.name === repository) || null,
+    [repository, repositoriesCache]
+  );
+  const startDisabledReason = useMemo(() => {
+    if (!repository) return "Select a repository first (Browse repos).";
+    if (!selectedRepoObj) return "Selected repository not found. Refresh the repos list.";
+    if (!selectedRepoObj.path) return "Selected repository has no path configured. Edit it (Browse repos) and set its Path.";
+    return "";
+  }, [repository, selectedRepoObj]);
+
+  const refreshRepositories = useCallback(async () => {
+    try {
+      const r = await api("GET", "/api/repositories");
+      setRepositoriesCache(Array.isArray(r.items) ? r.items : []);
+    } catch { /* ignore */ }
+  }, []);
+  useEffect(() => { refreshRepositories(); }, [refreshRepositories]);
+
+  // Splitter drag handlers
   useEffect(() => {
     if (!dragging) {
       document.body.classList.remove("is-dragging-splitter");
@@ -715,10 +852,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    api("GET", "/api/config").then(c => {
-      setConfig(c);
-      if (c.default_target_folder) setFolder(c.default_target_folder);
-    }).catch(console.error);
+    api("GET", "/api/config").then(c => setConfig(c)).catch(console.error);
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -728,6 +862,11 @@ function App() {
         const m = JSON.parse(ev.data);
         if (m.type === "progress") {
           setProgress(m.data);
+          // If the worker is running and broadcasting a repository, sync our
+          // header selection so the UI reflects what's actually being processed.
+          if (m.data.repository && !repository) {
+            setRepository(m.data.repository);
+          }
           const msg = m.data.last_message;
           if (msg) {
             const v = verbosityRef.current;
@@ -750,12 +889,8 @@ function App() {
     };
     ws.onclose = () => console.log("WS closed");
     return () => { try { ws.close(); } catch {} };
-  }, []);
-
-  useEffect(() => {
-    if (progress.target_folder && !folder) setFolder(progress.target_folder);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [progress.target_folder]);
+  }, []);
 
   const refreshFiles = useCallback(async () => {
     try {
@@ -764,9 +899,7 @@ function App() {
       if (search) params.set("search", search);
       if (shaFilter) params.set("sha256", shaFilter);
       if (dupOnly) params.set("duplicates_only", "true");
-      // Item 6: filter the grid by the chosen Repository. Empty input ->
-      // show only files with no Repository (the backend interprets an
-      // empty 'repository' query param as exact-empty filter).
+      // Filter the grid by the selected repository (empty -> files w/o repo).
       params.set("repository", repository.trim());
       params.set("limit", "2000");
       const r = await api("GET", `/api/files?${params.toString()}`);
@@ -780,17 +913,13 @@ function App() {
     return () => clearInterval(id);
   }, [refreshFiles]);
 
-  // Item 5: poll /api/progress every 3s as a safety net so the header
-  // stats always refresh even if a WebSocket broadcast is missed (e.g.
-  // when the worker thread is idle and only REST mutations change DB
-  // counts). The WS still drives instant updates when present.
   useEffect(() => {
     let aborted = false;
     const tickProgress = async () => {
       try {
         const p = await api("GET", "/api/progress");
         if (!aborted) setProgress(p);
-      } catch { /* ignore transient errors */ }
+      } catch { /* ignore */ }
     };
     const id = setInterval(tickProgress, 3000);
     return () => { aborted = true; clearInterval(id); };
@@ -798,24 +927,17 @@ function App() {
 
   // Actions
   const onStart = async () => {
-    if (!folder.trim()) { alert("Enter a folder path."); return; }
+    if (startDisabledReason) {
+      alert(startDisabledReason);
+      return;
+    }
     try {
-      await api("POST", "/api/start", {
-        target_folder: folder.trim(),
-        default_repository: repository.trim(),
-      });
-    } catch (e) { alert(e.message); }
-  };
-  const onBrowse = async () => {
-    try {
-      const r = await api("POST", "/api/pick-folder");
-      if (r.path) setFolder(r.path);
+      await api("POST", "/api/start", { repository: repository.trim() });
     } catch (e) { alert(e.message); }
   };
   const onPause  = () => api("POST", "/api/pause").catch(e => alert(e.message));
   const onResume = () => api("POST", "/api/resume").catch(e => alert(e.message));
   const onStop   = () => api("POST", "/api/stop").catch(e => alert(e.message));
-  const onUpdateRepo = () => api("POST", "/api/repository", { repository: repository.trim() }).catch(e => alert(e.message));
   const onDownload = () => { window.location.href = "/api/registry.xlsx"; };
 
   const reevaluatePaths = async (paths, withThinking, force = false) => {
@@ -833,12 +955,8 @@ function App() {
     const r = await reevaluatePaths(Array.from(selected), useThinking, false);
     if (r) {
       let msg = `Queued ${r.reset} file(s) for re-evaluation${useThinking ? " (thinking mode)" : ""}.`;
-      if (r.skipped_manual) {
-        msg += `\n${r.skipped_manual} manually-edited file(s) were SKIPPED. Use the "Force" button to override.`;
-      }
-      if (r.skipped_status) {
-        msg += `\n${r.skipped_status} file(s) in 'skipped' status were NOT re-evaluated. Set their status to 'pending' first.`;
-      }
+      if (r.skipped_manual) msg += `\n${r.skipped_manual} manually-edited file(s) were SKIPPED. Use Force to override.`;
+      if (r.skipped_status) msg += `\n${r.skipped_status} file(s) in 'skipped' status were NOT re-evaluated.`;
       alert(msg);
       setSelected(new Set());
       refreshFiles();
@@ -850,9 +968,7 @@ function App() {
     const r = await reevaluatePaths(Array.from(selected), useThinking, true);
     if (r) {
       let msg = `Queued ${r.reset} file(s) for re-evaluation (force).`;
-      if (r.skipped_status) {
-        msg += `\n${r.skipped_status} file(s) in 'skipped' status were NOT re-evaluated. Set their status to 'pending' first (Force does not override Skipped).`;
-      }
+      if (r.skipped_status) msg += `\n${r.skipped_status} file(s) in 'skipped' status were NOT re-evaluated.`;
       alert(msg);
       setSelected(new Set());
       refreshFiles();
@@ -862,7 +978,7 @@ function App() {
     const r = await reevaluatePaths([path], withThinking, false);
     if (r) {
       if (r.skipped_status) {
-        alert("This file is in 'skipped' status and cannot be re-evaluated.\n\nSet its status to 'pending' first (e.g. via the Edit panel) to re-evaluate.");
+        alert("This file is in 'skipped' status and cannot be re-evaluated.\n\nSet its status to 'pending' first.");
       } else if (r.skipped_manual) {
         if (confirm("This file is manually edited and was skipped. Force re-evaluate (discards edits)?")) {
           await reevaluatePaths([path], withThinking, true);
@@ -905,26 +1021,19 @@ function App() {
     } catch (e) { alert(e.message); }
   };
 
-  // Remove the selected files from the registry. Does NOT touch the file
-  // on disk. If the user re-scans the folder later, the file will be
-  // re-discovered and added back as a fresh 'pending' entry.
   const onRemoveFromRegistry = async (paths, opts = {}) => {
     const list = Array.isArray(paths) ? paths : [paths];
     if (list.length === 0) return false;
     const skipConfirm = !!opts.skipConfirm;
     if (!skipConfirm) {
       const msg = list.length === 1
-        ? `Remove this file from the registry?\n\n${list[0]}\n\n` +
-          `The file on disk is NOT deleted. Re-scan the folder to add it back as a fresh 'pending' entry.`
-        : `Remove ${list.length} files from the registry?\n\n` +
-          `The files on disk are NOT deleted. Re-scan the folder(s) to add them back as fresh 'pending' entries.`;
+        ? `Remove this file from the registry?\n\n${list[0]}\n\nThe file on disk is NOT deleted.`
+        : `Remove ${list.length} files from the registry?\n\nThe files on disk are NOT deleted.`;
       if (!confirm(msg)) return false;
     }
     try {
       const r = await api("POST", "/api/files/delete", { relative_paths: list });
-      // If the currently-opened file is in the removed set, close the panel
       if (openedPath && list.includes(openedPath)) setOpenedPath("");
-      // Drop them from the selection too
       setSelected(prev => {
         const ns = new Set(prev);
         for (const p of list) ns.delete(p);
@@ -949,7 +1058,6 @@ function App() {
   };
 
   const runElapsed = useMemo(() => {
-    // Only show elapsed when actively running (not idle/error)
     if (!progress.started_at) return "";
     if (progress.state === "idle" || progress.state === "error") return "";
     const t0 = new Date(progress.started_at).getTime();
@@ -967,45 +1075,46 @@ function App() {
       <div className="header">
         <h1>📚 docregistrar — local document indexer</h1>
         <div className="row">
-          {/* Item 7: Repository field + Apply repo button moved to the very
-              start of the row. Item 6: this same value also drives the
-              grid filter (the grid only shows files whose repository
-              matches; empty input -> files with no repository). */}
-          <input
-            type="text"
-            placeholder="Repository (e.g. SharePoint/Team-X) — also filters the grid"
-            value={repository}
-            onChange={e => setRepository(e.target.value)}
-            style={{ flex: 1, minWidth: 220 }}
-            title="Repository value used for two things: (1) the default Repository tagged on files processed from now on (click 'Apply repo' to update mid-run), and (2) the grid below shows only files whose Repository matches this value. Empty input shows files with no Repository."
-          />
-          <button onClick={() => setRepoPickerOpen(true)}
-                  title="Browse repositories already in use across the registry. You can pick one to fill the Repository field, or close the dialog and type a brand-new value.">
+          {/* Repository selector pill (shows the selected repo + its path) */}
+          <div className="repo-pill" title={
+            selectedRepoObj
+              ? `Selected repository: ${selectedRepoObj.name}\nPath: ${selectedRepoObj.path || '(none — set one to enable Start)'}\nDescription: ${selectedRepoObj.description || '—'}`
+              : "No repository selected. Click 'Browse repos' to pick or create one."
+          }>
+            <span>📁 Repository:</span>
+            {repository
+              ? <>
+                  <span className="repo-pill-name">{repository}</span>
+                  {selectedRepoObj?.path
+                    ? <span className="repo-pill-path">{selectedRepoObj.path}</span>
+                    : <span className="repo-pill-empty">(no path set)</span>}
+                </>
+              : <span className="repo-pill-empty">(none selected)</span>}
+          </div>
+          <button onClick={() => setRepoMgrOpen(true)}
+                  title="Open the repository management dialog (create / edit / delete / select)">
             🔎 Browse repos
           </button>
-          <button onClick={onUpdateRepo} title="Apply this Repository to files processed from now on">
-            Apply repo
-          </button>
-          <input
-            type="text"
-            placeholder="Target folder (e.g. C:/Users/me/Documents/MyDocs)"
-            value={folder}
-            onChange={e => setFolder(e.target.value)}
-            disabled={running && !paused}
-            style={{ flex: 2 }}
-            title="Absolute path to the folder to scan. Use forward slashes on Windows."
-          />
-          <button onClick={onBrowse} disabled={running && !paused} title="Open folder picker">
-            📂 Browse
-          </button>
-          {!running && <button className="primary" onClick={onStart}
-                               title="Scan the target folder and start processing pending files">▶ Start</button>}
+          {repository && (
+            <button onClick={() => setRepository("")}
+                    title="Clear the repository selection (the grid will then show files with no repository)">
+              ✕ Clear
+            </button>
+          )}
+          <div className="spacer" style={{ flex: 1 }}></div>
+          {!running && (
+            <button className="primary" onClick={onStart}
+                    disabled={!!startDisabledReason}
+                    title={startDisabledReason || "Scan the selected repository's folder and start processing"}>
+              ▶ Start
+            </button>
+          )}
           {running && !paused && <button onClick={onPause}
-                                          title="Pause processing between files (resume later from the same point)">⏸ Pause</button>}
+                                          title="Pause processing">⏸ Pause</button>}
           {paused && <button className="primary" onClick={onResume}
                               title="Resume processing">▶ Resume</button>}
           {running && <button className="danger" onClick={onStop}
-                              title="Stop the worker. The currently-processing file (if any) is requeued as pending. Returns to idle within ~1s.">⏹ Stop</button>}
+                              title="Stop processing">⏹ Stop</button>}
           <button onClick={onDownload} title="Download current registry as Excel">
             ⬇ Download .xlsx
           </button>
@@ -1016,6 +1125,7 @@ function App() {
         <div className="status-line">
           <span className={`pill state-${progress.state}`}>{progress.state.toUpperCase()}</span>
           <span>📁 {progress.target_folder || "(no folder)"}</span>
+          {progress.repository && <span>📦 {progress.repository}</span>}
           <span>📊 total: <b>{progress.total}</b></span>
           <span>✅ done: <b>{progress.done}</b></span>
           <span>⏳ pending: <b>{progress.pending}</b></span>
@@ -1049,10 +1159,9 @@ function App() {
               placeholder="search filename or path..."
               value={search}
               onChange={e => setSearch(e.target.value)}
-              title="Filter the table by a substring of the filename or relative path"
             />
-            <button onClick={refreshFiles} title="Reload the file list from the server">↻ Refresh</button>
-            <label title="Show only files that have at least one duplicate (same SHA-256) in the registry">
+            <button onClick={refreshFiles} title="Reload the file list">↻ Refresh</button>
+            <label>
               <input type="checkbox" className="checkbox"
                      checked={dupOnly}
                      onChange={e => setDupOnly(e.target.checked)} />
@@ -1061,35 +1170,32 @@ function App() {
             {shaFilter && (
               <span className="active-filter" title={`Filtering by SHA-256: ${shaFilter}`}>
                 SHA: {shaFilter.slice(0, 8)}…
-                <button onClick={() => setShaFilter("")}
-                        title="Clear the SHA-256 filter">×</button>
+                <button onClick={() => setShaFilter("")} title="Clear">×</button>
               </span>
             )}
             <div className="spacer"></div>
             <label>Verbosity:</label>
-            <select value={verbosity} onChange={e => setVerbosity(e.target.value)}
-                    title="How chatty the activity log on the right should be">
+            <select value={verbosity} onChange={e => setVerbosity(e.target.value)}>
               <option value="quiet">quiet</option>
               <option value="normal">normal</option>
               <option value="verbose">verbose</option>
             </select>
-            <label title="When checked, re-evaluations use the model's slower 'thinking' mode for higher quality">
+            <label>
               <input type="checkbox" className="checkbox"
                      checked={useThinking}
                      onChange={e => setUseThinking(e.target.checked)} />
               {" "}thinking mode
             </label>
             <button className="primary" onClick={onReevaluateBatch} disabled={selected.size === 0}
-                    title="Re-evaluate the selected files (manually-edited rows are skipped)">
+                    title="Re-evaluate selected files (manually-edited rows are skipped)">
               ↻ Re-evaluate {selected.size > 0 ? `(${selected.size})` : ""}
             </button>
             <button onClick={onReevaluateBatchForce} disabled={selected.size === 0}
-                    title="Re-evaluate the selected files, INCLUDING manually-edited ones (their edits will be lost)">
+                    title="Re-evaluate including manually-edited files">
               ↻ Force
             </button>
           </div>
 
-          {/* Bulk-edit toolbar (visible when selection > 0) */}
           {selected.size > 0 && (
             <div className="toolbar" style={{ background: "var(--panel)" }}>
               <span className="muted">Bulk edit ({selected.size}):</span>
@@ -1099,10 +1205,9 @@ function App() {
                 value={bulkRepo}
                 onChange={e => setBulkRepo(e.target.value)}
                 style={{ minWidth: 200 }}
-                title="Repository value to assign to all selected files when you click Apply. Leave empty to skip the repository update."
               />
-              <button onClick={() => setBulkRepoPickerOpen(true)}
-                      title="Browse repositories already in use and pick one to fill this Repository field. You can also type a brand-new value.">
+              <button onClick={() => setBulkRepoMgrOpen(true)}
+                      title="Browse repositories and pick one for the bulk-edit field">
                 🔎
               </button>
               <label>set Status:</label>
@@ -1112,14 +1217,14 @@ function App() {
               </select>
               <button className="primary" onClick={onBulkApply}>Apply</button>
               <button onClick={onSkipDupSiblings}
-                      title="Mark every OTHER file with the same SHA-256 as the selected files as 'skipped'. Selected files themselves stay unchanged."
+                      title="Mark every OTHER file with the same SHA-256 as 'skipped'"
                       disabled={selected.size === 0}>
                 Skip dup siblings
               </button>
               <button className="danger"
                       onClick={() => onRemoveFromRegistry(Array.from(selected))}
                       disabled={selected.size === 0}
-                      title="Permanently remove the selected files from the registry. The files on disk are NOT deleted; rescan the folder to add them back as fresh entries.">
+                      title="Permanently remove the selected files from the registry">
                 🗑 Remove from registry
               </button>
               <div className="spacer"></div>
@@ -1136,19 +1241,19 @@ function App() {
                       checked={selected.size > 0 && selected.size === files.length}
                       onChange={e => toggleSelAll(e.target.checked)} />
                   </th>
-                  <th title="File processing status. Hover to see error.">Status</th>
-                  <th title="Quality score (0–1)">Q</th>
-                  <th title="Duplicate marker">Dup</th>
+                  <th>Status</th>
+                  <th>Q</th>
+                  <th>Dup</th>
                   <th>Repository</th>
-                  <th title="Click file name to open the file in your OS default app">File</th>
+                  <th>File</th>
                   <th>Path</th>
                   <th>Type</th>
                   <th>Title</th>
                   <th>Date</th>
                   <th>Conf.</th>
                   <th>Size</th>
-                  <th title="Manually edited marker">✎</th>
-                  <th title="Click to filter table by this SHA-256">SHA-256</th>
+                  <th>✎</th>
+                  <th>SHA-256</th>
                 </tr>
               </thead>
               <tbody>
@@ -1192,7 +1297,9 @@ function App() {
                 ))}
                 {files.length === 0 && (
                   <tr><td colSpan={14} style={{ padding: 20, textAlign: "center", color: "var(--muted)" }}>
-                    No files. Click Start with a folder path to scan.
+                    No files. {!repository
+                      ? "Select a repository (Browse repos) and click Start to scan."
+                      : "Click Start to scan the selected repository's folder."}
                   </td></tr>
                 )}
               </tbody>
@@ -1201,7 +1308,7 @@ function App() {
         </div>
 
         <div className={`splitter ${dragging ? "dragging" : ""}`}
-             title="Drag to resize the side panel. Width is remembered across reloads."
+             title="Drag to resize the side panel"
              onMouseDown={() => setDragging(true)} />
 
         <div className="right-pane">
@@ -1211,12 +1318,9 @@ function App() {
               currentProgress={cfp}
               onClose={() => setOpenedPath("")}
               onReevaluate={onReevaluateOne}
-              onEdited={refreshFiles}
+              onEdited={() => { refreshFiles(); refreshRepositories(); }}
               onOpenSibling={path => setOpenedPath(path)}
               onRemoved={() => {
-                // Remove already happened on the server (the panel calls
-                // /api/files/delete itself before invoking this callback).
-                // Just close the panel and refresh the grid.
                 setOpenedPath("");
                 setSelected(prev => {
                   const ns = new Set(prev);
@@ -1242,23 +1346,39 @@ function App() {
         </div>
       </div>
 
-      {/* Repository picker dialogs (header + bulk-edit). Rendered at the
-          top level so the modal overlay covers the whole page. */}
-      <RepositoryPickerDialog
-        open={repoPickerOpen}
+      {/* Repository management dialogs (header + bulk-edit) */}
+      <RepositoryManagerDialog
+        open={repoMgrOpen}
+        currentSelection={repository}
         onPick={(value) => {
           setRepository(value);
-          setRepoPickerOpen(false);
+          setRepoMgrOpen(false);
+          refreshRepositories();
         }}
-        onClose={() => setRepoPickerOpen(false)}
+        onChanged={(oldName, newName) => {
+          // If the currently-selected repo got renamed or deleted, react.
+          refreshRepositories();
+          if (oldName && oldName === repository) {
+            if (newName === null) {
+              setRepository(""); // deleted
+            } else if (newName) {
+              setRepository(newName); // renamed
+            }
+          }
+          refreshFiles();
+        }}
+        onClose={() => setRepoMgrOpen(false)}
       />
-      <RepositoryPickerDialog
-        open={bulkRepoPickerOpen}
+      <RepositoryManagerDialog
+        open={bulkRepoMgrOpen}
+        currentSelection={bulkRepo}
         onPick={(value) => {
           setBulkRepo(value);
-          setBulkRepoPickerOpen(false);
+          setBulkRepoMgrOpen(false);
+          refreshRepositories();
         }}
-        onClose={() => setBulkRepoPickerOpen(false)}
+        onChanged={() => { refreshRepositories(); refreshFiles(); }}
+        onClose={() => setBulkRepoMgrOpen(false)}
       />
     </div>
   );

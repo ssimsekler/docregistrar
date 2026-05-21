@@ -25,7 +25,7 @@ SHEET_NAME = "Documents"
 COLUMNS: list[tuple[str, int]] = [
     ("File name", 30),
     ("Relative path", 50),
-    ("Full path", 60),
+    ("Repository path", 60),
     ("Repository", 18),
     ("File size (bytes)", 14),
     ("SHA-256", 36),
@@ -99,13 +99,17 @@ def _join(items: list[str] | None) -> str:
     return "; ".join(s for s in items if s)
 
 
-def _record_to_row(rec: FileRecord) -> list:
+def _record_to_row(rec: FileRecord, repo_paths: dict[str, str] | None = None) -> list:
     e = rec.extraction
+    repo_name = e.repository if e else ""
+    repo_path = ""
+    if repo_name and repo_paths is not None:
+        repo_path = repo_paths.get(repo_name, "") or ""
     return [
         rec.file_name,
         rec.relative_path,
-        rec.full_path or "",
-        (e.repository if e else ""),
+        repo_path,
+        repo_name,
         rec.file_size,
         rec.sha256,
         ("Yes" if rec.is_duplicate else ""),
@@ -144,7 +148,8 @@ def _record_to_row(rec: FileRecord) -> list:
     ]
 
 
-def write_registry(records: list[FileRecord], xlsx_path: Path) -> bool:
+def write_registry(records: list[FileRecord], xlsx_path: Path,
+                   repo_paths: dict[str, str] | None = None) -> bool:
     """Write/overwrite registry.xlsx atomically. Returns True on success."""
     xlsx_path = Path(xlsx_path)
     xlsx_path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,7 +178,7 @@ def write_registry(records: list[FileRecord], xlsx_path: Path) -> bool:
 
     body_align = Alignment(vertical="top", wrap_text=True)
     for rec in records:
-        row = _record_to_row(rec)
+        row = _record_to_row(rec, repo_paths)
         ws.append(row)
 
     # Apply alignment to body
@@ -207,7 +212,8 @@ def write_registry(records: list[FileRecord], xlsx_path: Path) -> bool:
         return False
 
 
-def build_registry_bytes(records: list[FileRecord]) -> bytes:
+def build_registry_bytes(records: list[FileRecord],
+                         repo_paths: dict[str, str] | None = None) -> bytes:
     """Build the registry workbook in memory and return its bytes.
 
     Used by the GET /api/registry.xlsx endpoint so users can download the
@@ -239,7 +245,7 @@ def build_registry_bytes(records: list[FileRecord]) -> bytes:
 
     body_align = Alignment(vertical="top", wrap_text=True)
     for rec in records:
-        ws.append(_record_to_row(rec))
+        ws.append(_record_to_row(rec, repo_paths))
     for r in range(2, ws.max_row + 1):
         for c in range(1, len(COLUMNS) + 1):
             ws.cell(row=r, column=c).alignment = body_align
