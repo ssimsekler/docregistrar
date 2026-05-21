@@ -142,6 +142,11 @@ class JobManager:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def broadcast_progress(self) -> None:
+        """Public hook so REST handlers can push fresh stats to clients
+        after a mutation that changes counts (item 5)."""
+        self._broadcast_progress()
+
     def start(self, target_folder: str, registry_xlsx: str = "",
               default_repository: str = "") -> None:
         if self.is_running() and self._state.state not in ("paused",):
@@ -201,7 +206,16 @@ class JobManager:
         self._wakeup.set()
 
     def stop(self) -> None:
+        # Item 4: even if the worker thread is no longer alive, force the
+        # state to 'idle' so the UI doesn't get stuck on 'stopping' or
+        # 'running' forever.
         if not self.is_running():
+            with self._lock:
+                if self._state.state != "idle":
+                    self._state.state = "idle"
+                    self._state.current_file = ""
+                    self._state.current_file_progress = None
+                    self._state.last_message = "Idle."
             self._set_state("idle", "Already idle")
             return
         self._set_state("stopping", "Stopping...")
@@ -306,6 +320,7 @@ class JobManager:
                 if self._state.state not in ("error",):
                     self._state.state = "idle"
                     self._state.current_file = ""
+                    self._state.current_file_progress = None
             self._broadcast_progress()
             log.info("Worker thread exiting.")
 
@@ -348,10 +363,23 @@ class JobManager:
                 created = datetime.fromtimestamp(st.st_ctime).isoformat(timespec="seconds")
                 modified = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
 
+                # Item 3: store both the file's full absolute path and its
+                # parent folder's full + relative paths so the UI can open
+                # files even after the worker is idle (i.e. when no active
+                # target_folder is set on the JobManager).
                 try:
                     full_path = str(p.resolve())
+                    full_folder_path = str(p.resolve().parent)
                 except OSError:
                     full_path = str(p)
+                    full_folder_path = str(p.parent)
+                # parent folder path relative to the scanned target ("" if
+                # the file is at the root of the scanned folder).
+                rel_parent = str(p.parent.relative_to(target)).replace("\\", "/")
+                if rel_parent in (".", ""):
+                    relative_folder_path = ""
+                else:
+                    relative_folder_path = rel_parent
 
                 status = self.db.upsert_file_basic(
                     relative_path=rel,
@@ -362,6 +390,8 @@ class JobManager:
                     os_created=created,
                     os_modified=modified,
                     full_path=full_path,
+                    full_folder_path=full_folder_path,
+                    relative_folder_path=relative_folder_path,
                 )
                 n_seen += 1
                 if status == "pending":
@@ -413,15 +443,12 @@ class JobManager:
 
                 rec = self.db.next_pending()
                 if rec is None:
-                    # No more pending. Stay alive (don't exit) — wait for a
-                    # poke (re-evaluate, edit-to-pending, scan added work) or
-                    # an explicit Stop.
-                    self._set_state("running", "Idle — no pending work; waiting...")
+                    # Item 4: no more pending work -> auto-stop the worker
+                    # so the UI returns to a clean idle state. The user
+                    # can press Start again to scan / resume processing.
                     self._regenerate_excel()
-                    processed_since_xlsx = 0
-                    self._wakeup.wait(timeout=5.0)
-                    self._wakeup.clear()
-                    continue
+                    self._set_state("idle", "Idle — no pending work; worker stopped.")
+                    return
 
                 self.db.mark_status(rec.relative_path, "processing")
                 with self._lock:

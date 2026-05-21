@@ -54,6 +54,8 @@ _LATER_COLUMNS = [
     ("indexing_started_at", "TEXT"),
     ("indexing_completed_at", "TEXT"),
     ("full_path", "TEXT NOT NULL DEFAULT ''"),
+    ("full_folder_path", "TEXT NOT NULL DEFAULT ''"),
+    ("relative_folder_path", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -127,6 +129,8 @@ class Database:
         os_created: Optional[str],
         os_modified: Optional[str],
         full_path: str = "",
+        full_folder_path: str = "",
+        relative_folder_path: str = "",
     ) -> str:
         """Insert a new pending row, or update size/sha/dates if file changed.
 
@@ -134,37 +138,59 @@ class Database:
         """
         with self.conn() as c:
             row = c.execute(
-                "SELECT sha256, status, full_path FROM files WHERE relative_path=?",
+                "SELECT sha256, status, full_path, full_folder_path, relative_folder_path "
+                "FROM files WHERE relative_path=?",
                 (relative_path,),
             ).fetchone()
             if row is None:
                 c.execute(
-                    """INSERT INTO files(relative_path, file_name, extension, file_size,
-                                         sha256, os_created, os_modified, status, full_path)
-                       VALUES(?,?,?,?,?,?,?, 'pending', ?)""",
-                    (relative_path, file_name, extension, file_size,
-                     sha256, os_created, os_modified, full_path),
+                    "INSERT INTO files(relative_path, file_name, extension, file_size, "
+                    "sha256, os_created, os_modified, status, full_path, "
+                    "full_folder_path, relative_folder_path) "
+                    "VALUES(?,?,?,?,?,?,?, 'pending', ?,?,?)",
+                    (
+                        relative_path, file_name, extension, file_size,
+                        sha256, os_created, os_modified, full_path,
+                        full_folder_path, relative_folder_path,
+                    ),
                 )
                 return "pending"
 
             if row["sha256"] != sha256:
                 # File changed → reset to pending
                 c.execute(
-                    """UPDATE files SET file_size=?, sha256=?, os_created=?, os_modified=?,
-                                        full_path=?,
-                                        status='pending', error='', extraction_json=NULL,
-                                        indexed_at=NULL, used_thinking=0
-                       WHERE relative_path=?""",
-                    (file_size, sha256, os_created, os_modified, full_path, relative_path),
+                    "UPDATE files SET file_size=?, sha256=?, os_created=?, os_modified=?, "
+                    "full_path=?, full_folder_path=?, relative_folder_path=?, "
+                    "status='pending', error='', extraction_json=NULL, "
+                    "indexed_at=NULL, used_thinking=0 "
+                    "WHERE relative_path=?",
+                    (
+                        file_size, sha256, os_created, os_modified,
+                        full_path, full_folder_path, relative_folder_path,
+                        relative_path,
+                    ),
                 )
                 return "pending"
 
-            # Unchanged content. Refresh full_path if it's empty or differs
-            # (the user may have moved the registry to a new mount point).
+            # Unchanged content; refresh path columns if they've drifted
+            # (e.g. a renamed mount point or a registry moved to a new
+            # machine, or older rows that pre-date these columns).
+            updates: list[str] = []
+            params: list[Any] = []
             if full_path and (row["full_path"] or "") != full_path:
+                updates.append("full_path=?")
+                params.append(full_path)
+            if full_folder_path and (row["full_folder_path"] or "") != full_folder_path:
+                updates.append("full_folder_path=?")
+                params.append(full_folder_path)
+            if (row["relative_folder_path"] or "") != relative_folder_path:
+                updates.append("relative_folder_path=?")
+                params.append(relative_folder_path)
+            if updates:
+                params.append(relative_path)
                 c.execute(
-                    "UPDATE files SET full_path=? WHERE relative_path=?",
-                    (full_path, relative_path),
+                    f"UPDATE files SET {', '.join(updates)} WHERE relative_path=?",
+                    params,
                 )
             return row["status"]
 
@@ -567,7 +593,21 @@ class Database:
         search: str = "",
         sha256: Optional[str] = None,
         duplicates_only: bool = False,
+        repository: Optional[str] = None,
     ) -> list[FileRecord]:
+        """List file rows.
+
+        `repository` semantics:
+          - `None` (default): no repository filter, return all rows.
+          - `""`            : return only rows whose repository is empty
+                              (i.e. extraction.repository is "" or NULL/missing).
+          - `"X"`           : return only rows whose extraction.repository == "X".
+
+        The repository value lives inside extraction_json, so we use
+        `json_extract` to filter on it. SQLite's json1 extension is
+        available by default in modern SQLite builds (and certainly in
+        the Python standard library since 3.9).
+        """
         sql = "SELECT * FROM files"
         clauses = []
         params: list[Any] = []
@@ -583,6 +623,19 @@ class Database:
             params.append(sha256)
         if duplicates_only:
             clauses.append("is_duplicate=1")
+        if repository is not None:
+            if repository == "":
+                # Empty repo filter: rows with no extraction yet, or with
+                # an explicitly-empty repository inside extraction_json.
+                clauses.append(
+                    "(extraction_json IS NULL "
+                    "OR COALESCE(json_extract(extraction_json, '$.repository'), '') = '')"
+                )
+            else:
+                clauses.append(
+                    "COALESCE(json_extract(extraction_json, '$.repository'), '') = ?"
+                )
+                params.append(repository)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY relative_path LIMIT ? OFFSET ?"
@@ -684,6 +737,28 @@ class Database:
             row = c.execute("SELECT COUNT(*) AS n FROM files").fetchone()
             return int(row["n"]) if row else 0
 
+    def list_repositories(self) -> list[dict]:
+        """Return all distinct, non-empty Repository values used across the
+        registry, with a per-repository usage count.
+
+        Used by the UI's "Browse repositories" picker so the user can
+        discover which Repository values are already in use rather than
+        re-typing them. Sorted alphabetically (case-insensitive).
+        """
+        with self.conn() as c:
+            rows = c.execute(
+                """
+                SELECT COALESCE(json_extract(extraction_json, '$.repository'), '') AS repo,
+                       COUNT(*) AS n
+                  FROM files
+                 WHERE extraction_json IS NOT NULL
+                   AND COALESCE(json_extract(extraction_json, '$.repository'), '') <> ''
+                 GROUP BY repo
+                 ORDER BY LOWER(repo)
+                """
+            ).fetchall()
+            return [{"repository": r["repo"], "count": int(r["n"])} for r in rows]
+
     def delete_files_not_in(self, present_paths: set[str]) -> int:
         """Remove DB rows for files no longer on disk."""
         if not present_paths:
@@ -699,6 +774,39 @@ class Database:
                 c.execute("DELETE FROM files WHERE relative_path=?", (p,))
                 n += 1
             return n
+
+    def delete_files(self, relative_paths: Iterable[str]) -> int:
+        """Permanently remove the given rows from the registry.
+
+        This does NOT touch the underlying file on disk. If the file is
+        still present and the containing folder is scanned again, the
+        file will be re-discovered and re-added as a fresh 'pending' row.
+
+        Returns the number of rows actually deleted.
+        """
+        n = 0
+        with self.conn() as c:
+            for p in relative_paths:
+                if not p:
+                    continue
+                cur = c.execute("DELETE FROM files WHERE relative_path=?", (p,))
+                n += cur.rowcount
+            # Recompute duplicate flags after a delete: removing one of two
+            # twins should clear is_duplicate=1 on the survivor. (Cheap
+            # because there's an index on sha256.)
+            if n > 0:
+                c.execute("UPDATE files SET is_duplicate = 0, duplicate_group = ''")
+                c.execute(
+                    """UPDATE files
+                          SET is_duplicate = 1,
+                              duplicate_group = sha256
+                        WHERE sha256 IN (
+                          SELECT sha256 FROM files
+                          GROUP BY sha256
+                          HAVING COUNT(*) >= 2
+                        )"""
+                )
+        return n
 
 
 def _row_to_record(row: sqlite3.Row) -> FileRecord:
@@ -724,6 +832,8 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
     return FileRecord(
         relative_path=row["relative_path"],
         full_path=_opt("full_path", "") or "",
+        full_folder_path=_opt("full_folder_path", "") or "",
+        relative_folder_path=_opt("relative_folder_path", "") or "",
         file_name=row["file_name"],
         extension=row["extension"],
         file_size=int(row["file_size"]),

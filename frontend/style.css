@@ -465,3 +465,113 @@ tbody tr.dup-row td { box-shadow: inset 3px 0 0 var(--amber); }
   flex-wrap: wrap;
 }
 .kv-status { color: var(--muted); font-size: 12px; }
+
+/* ---------- Modal dialog (Repository picker, etc.) ---------- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  border-radius: 10px 10px 0 0;
+}
+.modal-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  flex: 1;
+}
+.modal-head button.modal-close {
+  padding: 2px 8px;
+  font-size: 14px;
+}
+.modal-body {
+  flex: 1;
+  overflow: auto;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+.modal-body input.modal-search {
+  padding: 7px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+.modal-foot {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  border-radius: 0 0 10px 10px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* Repository picker list */
+.repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: auto;
+  max-height: 50vh;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px;
+  background: var(--panel-2);
+}
+.repo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.repo-row:hover {
+  background: rgba(59, 130, 246, 0.18);
+}
+.repo-row.no-repo {
+  font-style: italic;
+  color: var(--muted);
+}
+.repo-row .repo-name {
+  flex: 1;
+  word-break: break-word;
+}
+.repo-row .repo-count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.repo-empty {
+  color: var(--muted);
+  padding: 8px;
+  font-size: 12px;
+  font-style: italic;
+}

@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -20,6 +21,7 @@ from .excel_writer import build_registry_bytes
 from .jobmanager import JobManager
 from .schemas import (
     BulkEditRequest,
+    DeleteFilesRequest,
     FileEditRequest,
     ReevaluateRequest,
     SetRepositoryRequest,
@@ -165,6 +167,15 @@ def api_set_repository(req: SetRepositoryRequest):
     return {"repository": req.repository}
 
 
+@app.get("/api/repositories")
+def api_list_repositories():
+    """List all distinct, non-empty Repository values currently in use across
+    the registry, with usage counts. Powers the "Browse repositories"
+    picker in the UI.
+    """
+    return {"items": db.list_repositories()}
+
+
 @app.post("/api/reevaluate")
 def api_reevaluate(req: ReevaluateRequest):
     if not req.relative_paths:
@@ -174,6 +185,9 @@ def api_reevaluate(req: ReevaluateRequest):
         use_thinking=req.use_thinking,
         force=req.force,
     )
+    # Item 5: re-eval changes status counts (rows flip back to 'pending');
+    # push fresh stats to clients so the header refreshes immediately.
+    job.broadcast_progress()
     return {
         "reset": n_reset,
         "skipped_manual": n_skipped,
@@ -201,6 +215,9 @@ def api_file_edit(relative_path: str, body: FileEditRequest):
     # file currently being processed, signal the worker so it aborts cleanly.
     if fields.get("status") == "skipped":
         job.signal_skip(relative_path)
+    # Item 5: any field edit may change the visible counts (e.g. status
+    # changes, repository changes). Push fresh stats to all WS clients.
+    job.broadcast_progress()
     rec = db.get_file(relative_path)
     return rec.model_dump() if rec else {"ok": True}
 
@@ -222,6 +239,8 @@ def api_files_bulk_edit(body: BulkEditRequest):
     if body.status == "skipped":
         for p in body.relative_paths:
             job.signal_skip(p)
+    # Item 5: bulk edits commonly change status counts; push a fresh snapshot.
+    job.broadcast_progress()
     return {"updated": n}
 
 
@@ -233,6 +252,11 @@ def api_files(
     offset: int = 0,
     sha256: str | None = None,
     duplicates_only: bool = False,
+    # Item 6: filter the grid by Repository.
+    #   - parameter omitted entirely  -> no repository filter (all rows)
+    #   - parameter present but empty -> rows whose repository is empty
+    #   - parameter present, non-empty -> exact-match repository filter
+    repository: str | None = None,
 ):
     records = db.list_files(
         status=status if status else None,
@@ -241,6 +265,7 @@ def api_files(
         search=search,
         sha256=sha256 if sha256 else None,
         duplicates_only=duplicates_only,
+        repository=repository,
     )
     out = []
     for r in records:
@@ -292,7 +317,34 @@ def api_skip_dup_siblings(body: SkipDupSiblingsRequest):
     if not body.relative_paths:
         raise HTTPException(400, "relative_paths is required")
     n = db.skip_dup_siblings_of(body.relative_paths)
+    # Item 5: rows have flipped to 'skipped' so the header counts changed.
+    job.broadcast_progress()
     return {"updated": n}
+
+
+@app.post("/api/files/delete")
+def api_files_delete(body: DeleteFilesRequest):
+    """Permanently remove the given files from the registry.
+
+    The actual file on disk is NOT deleted. If the containing folder is
+    later rescanned, each file will be re-discovered and added back as a
+    fresh 'pending' entry.
+
+    If any of the targeted files is currently being processed by the
+    worker, we send a skip signal first so the worker stops touching it
+    and doesn't try to write back a row that's about to be deleted.
+    """
+    if not body.relative_paths:
+        raise HTTPException(400, "relative_paths is required")
+    # If any of them is the currently-processing file, signal the worker to
+    # abort that file cleanly (it'll be requeued/skipped). Then we delete.
+    for p in body.relative_paths:
+        if p:
+            job.signal_skip(p)
+    n = db.delete_files(body.relative_paths)
+    # Item 5: counts changed -> push fresh stats.
+    job.broadcast_progress()
+    return {"deleted": n}
 
 
 @app.get("/api/registry.xlsx")
@@ -309,13 +361,51 @@ def api_registry_download():
     )
 
 
+def _resolve_file_path(rel: str) -> Path:
+    """Resolve the absolute Path on disk for a registry row, even when the
+    JobManager is idle (items 1, 2, 3).
+
+    Strategy:
+      1. Look up the row in the DB. If it has a non-empty `full_path`, use it.
+      2. Otherwise try `full_folder_path` + file_name.
+      3. As a last resort, fall back to the active `target_folder` + rel.
+    Raises HTTPException on any failure.
+    """
+    rec = db.get_file(rel)
+    if rec is None:
+        raise HTTPException(404, f"File not found in registry: {rel}")
+
+    candidate: Optional[Path] = None
+    if rec.full_path:
+        candidate = Path(rec.full_path)
+    elif rec.full_folder_path and rec.file_name:
+        candidate = Path(rec.full_folder_path) / rec.file_name
+
+    if candidate is None:
+        target_folder = job.snapshot().target_folder
+        if not target_folder:
+            raise HTTPException(
+                400,
+                "No stored full_path for this file and no active target "
+                "folder. Re-scan the folder so paths get recorded.",
+            )
+        candidate = Path(target_folder) / rel
+
+    try:
+        return candidate.resolve()
+    except OSError:
+        return candidate
+
+
 @app.post("/api/open-file")
 def api_open_file(req: OpenFileRequest):
     """Open a file from the registry in the OS default app.
 
+    Item 1 + 3: works even when the JobManager is idle, because we look up
+    the file's stored absolute path from the DB instead of requiring an
+    active target_folder.
+
     Safety:
-      - Only files inside the active target_folder may be opened (no path
-        traversal).
       - Extensions in BLOCKED_OPEN_EXTENSIONS (executables / scripts) are
         refused with HTTP 403.
       - Macro-enabled Office files (.xlsm, .docm, .pptm, .xlsb) are allowed:
@@ -325,20 +415,10 @@ def api_open_file(req: OpenFileRequest):
     if not rel:
         raise HTTPException(400, "relative_path is required")
 
-    target_folder = job.snapshot().target_folder
-    if not target_folder:
-        raise HTTPException(400, "No active target folder")
-
-    try:
-        base = Path(target_folder).resolve()
-        full = (base / rel).resolve()
-        # Ensure the resolved file is inside the target folder
-        full.relative_to(base)
-    except (ValueError, OSError):
-        raise HTTPException(400, "Invalid path")
+    full = _resolve_file_path(rel)
 
     if not full.exists() or not full.is_file():
-        raise HTTPException(404, f"File not found: {rel}")
+        raise HTTPException(404, f"File not found on disk: {full}")
 
     ext = full.suffix.lower()
     if ext in BLOCKED_OPEN_EXTENSIONS:
@@ -360,7 +440,7 @@ def api_open_file(req: OpenFileRequest):
     except Exception as e:
         raise HTTPException(500, f"Failed to open file: {e}")
 
-    return {"ok": True, "opened": rel}
+    return {"ok": True, "opened": rel, "full_path": str(full)}
 
 
 @app.post("/api/open-file-location")
@@ -368,40 +448,49 @@ def api_open_file_location(req: OpenFileRequest):
     """Open the OS file explorer at the file's parent folder, with the
     file selected/highlighted when the platform supports it.
 
-    Safety: only files inside the active target_folder may be revealed
-    (path-traversal guard, identical to /api/open-file). No extension
-    blocklist is needed because we never execute the file — we only open
-    its containing folder.
+    Item 2 + 3: works even when the JobManager is idle, by using the
+    stored full_path / full_folder_path from the DB.
     """
     rel = (req.relative_path or "").strip()
     if not rel:
         raise HTTPException(400, "relative_path is required")
 
-    target_folder = job.snapshot().target_folder
-    if not target_folder:
-        raise HTTPException(400, "No active target folder")
+    rec = db.get_file(rel)
+    if rec is None:
+        raise HTTPException(404, f"File not found in registry: {rel}")
 
-    try:
-        base = Path(target_folder).resolve()
-        full = (base / rel).resolve()
-        full.relative_to(base)  # raises if outside
-    except (ValueError, OSError):
-        raise HTTPException(400, "Invalid path")
+    # Prefer the explicit folder column; fall back to the file's parent.
+    full = _resolve_file_path(rel)
+    if rec.full_folder_path:
+        try:
+            parent = Path(rec.full_folder_path).resolve()
+        except OSError:
+            parent = Path(rec.full_folder_path)
+    else:
+        parent = full.parent
 
-    # If the file went missing on disk, fall back to opening the parent
-    # folder (best-effort) so the user still gets close to where it lived.
-    parent = full if full.is_dir() else full.parent
     if not parent.exists():
-        raise HTTPException(404, f"Folder not found: {parent}")
+        # As a last resort, also try the file's parent (might differ if
+        # the stored full_folder_path is stale).
+        if full.parent.exists():
+            parent = full.parent
+        else:
+            raise HTTPException(404, f"Folder not found: {parent}")
 
     try:
         if sys.platform.startswith("win"):
             if full.exists():
-                # Open Explorer with the file pre-selected.
-                # Note: explorer.exe wants the path quoted.
+                # Open Explorer with the file pre-selected and its folder
+                # showing (item 2). The /select switch DOES open Explorer
+                # at that folder; we just need to make sure we pass the
+                # full file path, not just the folder.
                 import subprocess
-                subprocess.Popen(["explorer", f"/select,{str(full)}"])
+                # NOTE: ", " between /select and the path is intentional —
+                # explorer.exe is finicky about syntax. Both forms work,
+                # but using a single argument is safest.
+                subprocess.Popen(f'explorer /select,"{str(full)}"')
             else:
+                # File is gone; just open the parent folder.
                 os.startfile(str(parent))  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
             import subprocess
@@ -415,7 +504,12 @@ def api_open_file_location(req: OpenFileRequest):
     except Exception as e:
         raise HTTPException(500, f"Failed to open file location: {e}")
 
-    return {"ok": True, "revealed": rel, "folder": str(parent)}
+    return {
+        "ok": True,
+        "revealed": rel,
+        "folder": str(parent),
+        "full_path": str(full),
+    }
 
 
 # -------- WebSocket --------

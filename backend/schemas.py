@@ -57,7 +57,9 @@ FileStatus = Literal["pending", "processing", "done", "error", "skipped"]
 
 class FileRecord(BaseModel):
     relative_path: str
-    full_path: str = ""                     # absolute resolved path on the host filesystem
+    full_path: str = ""                     # absolute resolved path of the file on the host filesystem
+    full_folder_path: str = ""              # absolute path of the file's containing folder
+    relative_folder_path: str = ""          # folder path relative to the scanned target ("" for files at the root)
     file_name: str
     extension: str
     file_size: int
@@ -139,6 +141,13 @@ class BulkEditRequest(BaseModel):
 class SkipDupSiblingsRequest(BaseModel):
     """Mark every other file sharing the same SHA-256 as the given files
     as 'skipped'. The given files themselves are NOT modified."""
+    relative_paths: list[str]
+
+
+class DeleteFilesRequest(BaseModel):
+    """Permanently remove the given rows from the registry. Does NOT touch
+    the file on disk; if the folder is rescanned, the file is added back
+    as a fresh 'pending' entry."""
     relative_paths: list[str]
 
 
