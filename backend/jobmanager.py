@@ -25,7 +25,15 @@ from .config import (
 from .db import Database
 from .excel_writer import write_registry
 from .extractors import extract_any, truncate_head_middle_tail
-from .llm import LMClient, LLMError
+from .llm import (
+    LLMCancelled,
+    LLMError,
+    LLMHTTPError,
+    LLMInvalidJSONError,
+    LLMSchemaError,
+    LLMTransportError,
+    LMClient,
+)
 from .schemas import (
     CurrentFileProgress,
     FileStep,
@@ -406,12 +414,8 @@ class JobManager:
                     os_created=created,
                     os_modified=modified,
                     relative_folder_path=relative_folder_path,
+                    repository=repository,
                 )
-
-                # Auto-assign the active repository to this file (without
-                # touching manually_edited).
-                if repository:
-                    self.db.assign_repository(rel, repository)
 
                 n_seen += 1
                 if status == "pending":
@@ -425,6 +429,7 @@ class JobManager:
                         rel,
                         "skipped",
                         f"not_a_document_or_image: {ext or '(no extension)'}",
+                        repository=repository,
                     )
 
                 if n_seen % 50 == 0:
@@ -457,13 +462,18 @@ class JobManager:
                         break
                     self._set_state("running", "Resumed")
 
-                rec = self.db.next_pending()
+                rec = self.db.next_pending(
+                    max_error_retries=cfg.processing.max_error_retries,
+                )
                 if rec is None:
                     self._regenerate_excel()
                     self._set_state("idle", "Idle — no pending work; worker stopped.")
                     return
 
-                self.db.mark_status(rec.relative_path, "processing")
+                self.db.mark_status(
+                    rec.relative_path, "processing",
+                    repository=rec.repository,
+                )
                 with self._lock:
                     self._state.current_file = rec.relative_path
                 self._broadcast_progress()
@@ -522,7 +532,10 @@ class JobManager:
         if rec.extension not in ALLOWED_DOC_OR_IMAGE_EXTENSIONS:
             reason = f"not_a_document_or_image: {rec.extension or '(no extension)'}"
             self._begin_step("skip_non_doc", percent=100, detail=reason)
-            self.db.mark_status(rec.relative_path, "skipped", reason)
+            self.db.mark_status(
+                rec.relative_path, "skipped", reason,
+                repository=rec.repository,
+            )
             self._set_message(f"Skipped (not a document or image): {rec.relative_path}")
             self._end_step("skip_non_doc", percent=100, detail="skipped")
             self._end_file()
@@ -532,36 +545,42 @@ class JobManager:
         path = self._resolve_file_for_processing(rec)
         if path is None:
             reason = (
-                "Cannot resolve file path: file has no repository assigned, "
+                "resolve_path_failed: file has no repository assigned, "
                 "or its repository has no path configured."
             )
             self._begin_step("resolve_path", percent=5, detail=reason)
-            self.db.mark_status(rec.relative_path, "error", reason)
+            self.db.mark_status(
+                rec.relative_path, "error", reason,
+                repository=rec.repository, stage="resolve_path",
+            )
             self._set_message(f"Path resolution failed: {rec.relative_path}")
             self._end_step("resolve_path", percent=10, detail="failed")
             self._end_file()
             return False
         if not path.exists():
-            reason = f"File not found at resolved path: {path}"
+            reason = f"file_not_found: {path}"
             self._begin_step("resolve_path", percent=5, detail=reason)
-            self.db.mark_status(rec.relative_path, "error", reason)
+            self.db.mark_status(
+                rec.relative_path, "error", reason,
+                repository=rec.repository, stage="resolve_path",
+            )
             self._set_message(f"Path resolution failed: {rec.relative_path}")
             self._end_step("resolve_path", percent=10, detail="missing")
             self._end_file()
             return False
 
         # Reuse extraction from a byte-identical sibling that's already done.
-        sibling = self.db.find_done_sibling(rec.sha256, rec.relative_path)
+        sibling = self.db.find_done_sibling(rec.sha256, rec.id)
         if sibling is not None:
-            default_repo = self._state.repository or ""
+            default_repo = rec.repository or self._state.repository or ""
             self._begin_step(
                 "dup_reuse",
                 percent=50,
                 detail=f"Reusing extraction from duplicate: {sibling.relative_path}",
             )
             ok_copy = self.db.copy_extraction_from_sibling(
-                rec.relative_path,
-                sibling.relative_path,
+                rec.id,
+                sibling.id,
                 default_repository=default_repo,
             )
             if ok_copy:
@@ -588,14 +607,22 @@ class JobManager:
                 self.db.mark_status(
                     rec.relative_path, "skipped",
                     "Skipped by user during processing.",
+                    repository=rec.repository,
                 )
                 self._set_message(f"Skipped (user request) during extract_text: {rec.relative_path}")
                 self._end_file()
                 return True
 
             if res.extraction_error and not res.text:
+                detail = (
+                    f"text_extraction_failed [{rec.extension}]: {res.extraction_error} "
+                    f"(file_size={_fmt_size(rec.file_size)})"
+                )
                 self._end_step("extract_text", percent=10, detail=f"FAILED: {res.extraction_error}")
-                self.db.mark_status(rec.relative_path, "error", f"extraction: {res.extraction_error}")
+                self.db.mark_status(
+                    rec.relative_path, "error", detail,
+                    repository=rec.repository, stage="extract_text",
+                )
                 self._set_message(f"Extraction failed: {rec.relative_path} ({res.extraction_error})")
                 self._end_file()
                 return False
@@ -630,12 +657,26 @@ class JobManager:
                     relative_path=rec.relative_path,
                     use_thinking=override,
                 )
+            except LLMCancelled:
+                # The user asked to skip mid-call.
+                self._end_step("llm_extract", percent=50, detail="cancelled (user skip)")
+                self.db.mark_status(
+                    rec.relative_path, "skipped",
+                    "Skipped by user during processing.",
+                    repository=rec.repository,
+                )
+                self._set_message(
+                    f"Skipped (user request) during llm_extract: {rec.relative_path}"
+                )
+                self._end_file()
+                return True
             except LLMError as e:
                 if self._consume_skip_signal(rec.relative_path):
                     self._end_step("llm_extract", percent=50, detail="skipped by user (cancelled LLM)")
                     self.db.mark_status(
                         rec.relative_path, "skipped",
                         "Skipped by user during processing.",
+                        repository=rec.repository,
                     )
                     self._set_message(
                         f"Skipped (user request) during llm_extract: {rec.relative_path}"
@@ -649,6 +690,7 @@ class JobManager:
                 self.db.mark_status(
                     rec.relative_path, "skipped",
                     "Skipped by user during processing.",
+                    repository=rec.repository,
                 )
                 self._set_message(
                     f"Skipped (user request) after llm_extract: {rec.relative_path}"
@@ -692,16 +734,78 @@ class JobManager:
             self._end_file()
             return True
 
+        except LLMHTTPError as e:
+            detail = (
+                f"llm_http_{e.status_code}: {e.body_snippet} "
+                f"(model={e.model!r}, url={e.base_url!r})"
+            )
+            self._fail_step(detail=detail)
+            self.db.mark_status(
+                rec.relative_path, "error", detail,
+                repository=rec.repository, stage="llm_extract",
+            )
+            self._set_message(f"LLM HTTP error on {rec.relative_path}: {e}")
+            self._end_file()
+            return False
+        except LLMInvalidJSONError as e:
+            detail = f"llm_invalid_json: {e.raw_snippet} (model={cfg.llm.model!r})"
+            self._fail_step(detail=detail)
+            self.db.mark_status(
+                rec.relative_path, "error", detail,
+                repository=rec.repository, stage="llm_extract",
+            )
+            self._set_message(f"LLM returned invalid JSON: {rec.relative_path}")
+            self._end_file()
+            return False
+        except LLMSchemaError as e:
+            detail = f"llm_schema_validation_failed: {e.details}"
+            self._fail_step(detail=detail)
+            self.db.mark_status(
+                rec.relative_path, "error", detail,
+                repository=rec.repository, stage="llm_extract",
+            )
+            self._set_message(f"LLM schema validation failed: {rec.relative_path}")
+            self._end_file()
+            return False
+        except LLMTransportError as e:
+            detail = (
+                f"llm_transport_error: {e} "
+                f"(url={cfg.llm.base_url!r}, timeout={cfg.llm.request_timeout_seconds}s)"
+            )
+            self._fail_step(detail=detail)
+            self.db.mark_status(
+                rec.relative_path, "error", detail,
+                repository=rec.repository, stage="llm_extract",
+            )
+            self._set_message(f"LLM transport error on {rec.relative_path}: {e}")
+            self._end_file()
+            return False
         except LLMError as e:
-            self._fail_step(detail=f"LLM error: {e}")
-            self.db.mark_status(rec.relative_path, "error", f"llm: {e}")
+            # Catch-all for any other LLM-related failure.
+            detail = f"llm_error: {type(e).__name__}: {e}"
+            self._fail_step(detail=detail)
+            self.db.mark_status(
+                rec.relative_path, "error", detail,
+                repository=rec.repository, stage="llm_extract",
+            )
             self._set_message(f"LLM error on {rec.relative_path}: {e}")
             self._end_file()
             return False
         except Exception as e:
             log.exception("Unexpected error processing %s", rec.relative_path)
+            current_step = (
+                self._state.current_file_progress.current_step
+                if self._state.current_file_progress else ""
+            )
+            detail = (
+                f"unexpected_error: {type(e).__name__}: {e}"
+                + (f" | step={current_step}" if current_step else "")
+            )
             self._fail_step(detail=f"{type(e).__name__}: {e}")
-            self.db.mark_status(rec.relative_path, "error", f"{type(e).__name__}: {e}")
+            self.db.mark_status(
+                rec.relative_path, "error", detail,
+                repository=rec.repository, stage=current_step or "unknown",
+            )
             self._set_message(f"Error on {rec.relative_path}: {e}")
             self._end_file()
             return False

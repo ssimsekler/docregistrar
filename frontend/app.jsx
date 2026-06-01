@@ -1267,7 +1267,17 @@ function App() {
                         onChange={() => toggleSel(f.relative_path)} />
                     </td>
                     <td className={`status-cell status-${f.status}`}
-                        title={f.error ? `Error: ${f.error}` : f.status}>{f.status}</td>
+                        title={
+                          (f.error ? `Error: ${f.error}\n` : "") +
+                          (f.error_count ? `Failed attempts: ${f.error_count}` : f.status)
+                        }>
+                      {f.status}
+                      {f.error_count > 0 && (
+                        <span className="muted" style={{ marginLeft: 4, fontSize: 10 }}>
+                          (×{f.error_count})
+                        </span>
+                      )}
+                    </td>
                     <td>{f.quality_score !== "" && f.quality_score != null ? Number(f.quality_score).toFixed(2) : ""}</td>
                     <td className="dup-cell" title={f.is_duplicate ? "This file has duplicates (same SHA-256)" : ""}>{f.is_duplicate ? "🟰" : ""}</td>
                     <td className="truncate" title={f.repository}>{f.repository || ""}</td>

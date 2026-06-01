@@ -96,6 +96,45 @@ Output rules:
 
 
 class LLMError(RuntimeError):
+    """Base class for all LLM-extraction failures."""
+    pass
+
+
+class LLMTransportError(LLMError):
+    """Network / connection failure talking to the LLM server."""
+    pass
+
+
+class LLMHTTPError(LLMError):
+    """LLM server returned a non-2xx HTTP response."""
+    def __init__(self, status_code: int, body_snippet: str, base_url: str = "", model: str = ""):
+        self.status_code = status_code
+        self.body_snippet = body_snippet
+        self.base_url = base_url
+        self.model = model
+        msg = (
+            f"LM Studio returned HTTP {status_code} (model={model!r}, url={base_url!r}). "
+            f"Body: {body_snippet}"
+        )
+        super().__init__(msg)
+
+
+class LLMInvalidJSONError(LLMError):
+    """Model returned text that is not valid JSON."""
+    def __init__(self, raw_snippet: str):
+        self.raw_snippet = raw_snippet
+        super().__init__(f"LLM did not return valid JSON. First 200 chars: {raw_snippet!r}")
+
+
+class LLMSchemaError(LLMError):
+    """Model returned valid JSON but it failed Pydantic schema validation."""
+    def __init__(self, details: str):
+        self.details = details
+        super().__init__(f"LLM JSON failed schema validation: {details}")
+
+
+class LLMCancelled(LLMError):
+    """The in-flight LLM call was cancelled (e.g. user pressed Stop)."""
     pass
 
 
@@ -260,26 +299,28 @@ class LMClient:
         try:
             r = self._client.post("/chat/completions", json=body)
         except (httpx.HTTPError, RuntimeError) as e:
-            # If we were cancelled, surface a clean error (don't retry).
             if self._cancelled:
-                raise LLMError("cancelled") from e
-            raise
+                raise LLMCancelled("cancelled") from e
+            # Network/connection errors are LLMTransportError. tenacity may
+            # still retry httpx.HTTPError below; final failures bubble up.
+            raise LLMTransportError(f"{type(e).__name__}: {e}") from e
 
         if r.status_code >= 400:
-            # Surface LM Studio's actual error message instead of just the status
-            # so the user can fix the request (model id, unsupported field, etc.)
             try:
                 err_body = r.json()
+                body_str = json.dumps(err_body, ensure_ascii=False)
             except Exception:
-                err_body = r.text
+                body_str = r.text or ""
+            snippet = (body_str or "")[:500]
             log.error(
                 "LM Studio %s on %s. Request model=%r. Response: %r",
-                r.status_code, r.request.url, self.cfg.model, err_body,
+                r.status_code, r.request.url, self.cfg.model, body_str,
             )
-            raise LLMError(
-                f"LM Studio returned {r.status_code}: {err_body}. "
-                f"Check that 'llm.model' in config.yaml exactly matches an id from "
-                f"GET {self.cfg.base_url}/models."
+            raise LLMHTTPError(
+                status_code=r.status_code,
+                body_snippet=snippet,
+                base_url=self.cfg.base_url,
+                model=self.cfg.model,
             )
 
         data = r.json()
@@ -329,13 +370,16 @@ class LMClient:
     @classmethod
     def _parse(cls, raw: str) -> LLMExtraction:
         if not raw:
-            raise LLMError("empty model response")
+            raise LLMInvalidJSONError("(empty response)")
         cleaned = cls._strip_thinking(raw)
-        json_str = cls._extract_json_object(cleaned)
+        try:
+            json_str = cls._extract_json_object(cleaned)
+        except LLMError:
+            raise LLMInvalidJSONError(cleaned[:200])
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
-            raise LLMError(f"invalid JSON: {e}")
+            raise LLMInvalidJSONError(f"{e}: {json_str[:200]}")
 
         # Defensive cleanup
         if isinstance(data.get("summary"), str) and len(data["summary"]) > 2500:
@@ -379,4 +423,4 @@ class LMClient:
         try:
             return LLMExtraction(named_entities=ne, **data)
         except Exception as e:
-            raise LLMError(f"schema validation failed: {e}")
+            raise LLMSchemaError(f"{type(e).__name__}: {e}")

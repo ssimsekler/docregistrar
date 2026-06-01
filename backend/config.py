@@ -35,11 +35,19 @@ class ServerConfig(BaseModel):
     port: int = 8000
 
 
+class ProcessingConfig(BaseModel):
+    # How many automatic retries an 'error' file gets before the worker stops
+    # picking it up on its own. Manual Re-evaluate always works and resets the
+    # counter. 0 = never auto-retry an error file (it must be re-evaluated).
+    max_error_retries: int = 2
+
+
 class AppConfig(BaseModel):
     target_folder: str = ""
     registry_xlsx: str = ""
     llm: LLMConfig = Field(default_factory=LLMConfig)
     extract: ExtractConfig = Field(default_factory=ExtractConfig)
+    processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     include_extensions: list[str] = Field(
         default_factory=lambda: [
             ".pdf", ".docx", ".pptx", ".xlsx",
