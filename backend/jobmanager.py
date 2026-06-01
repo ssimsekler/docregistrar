@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import math
 import os
 import threading
 import time
@@ -901,6 +900,15 @@ class JobManager:
             llm_last_emit = [0.0]
             LLM_EMIT_THROTTLE_S = 0.5
 
+            # Track when each chunk / the reduce step actually started so
+            # the heartbeat can show per-chunk elapsed time even between
+            # chunk-completion events. Mutable dict so the closures (both
+            # the chunk callback and the heartbeat thread) can share it.
+            chunk_state: dict[str, Optional[float]] = {
+                "chunk_started_at": None,   # monotonic when current chunk began
+                "reduce_started_at": None,  # monotonic when reduce step began
+            }
+
             def _on_llm_progress(unit: str, cur: int, total: int) -> None:
                 if self._consume_skip_signal(rec.relative_path):
                     raise LLMCancelled("user skip during llm_extract")
@@ -913,6 +921,36 @@ class JobManager:
                     self._set_state("running", "Resumed")
                 if self._stop_event.is_set():
                     raise LLMCancelled("stopped between chunks")
+
+                # Track per-chunk / per-reduce start timestamps so the
+                # heartbeat can render "(chunk elapsed: Ms)" between
+                # chunk-completion events.
+                #
+                # Semantics from the LLM client:
+                #   cb("chunk", 0, total)   -> map phase about to start;
+                #                              chunk 1 begins now
+                #   cb("chunk", i, total) i>0 -> chunk i just FINISHED;
+                #                                if i < total, chunk i+1
+                #                                begins now
+                #   cb("reduce", 0, 1)      -> reduce step starting now
+                #   cb("reduce", 1, 1)      -> reduce finished
+                now_mono = time.monotonic()
+                if unit == "chunk":
+                    if cur == 0:
+                        # First call, before any chunk runs.
+                        chunk_state["chunk_started_at"] = now_mono
+                    elif cur < total:
+                        # Chunk `cur` just finished; chunk `cur+1` starts.
+                        chunk_state["chunk_started_at"] = now_mono
+                    else:
+                        # cur == total: all chunks done.
+                        chunk_state["chunk_started_at"] = None
+                elif unit == "reduce":
+                    if cur == 0:
+                        chunk_state["reduce_started_at"] = now_mono
+                    else:
+                        chunk_state["reduce_started_at"] = None
+
                 # Always-fresh in-memory state.
                 with self._lock:
                     cfp = self._state.current_file_progress
@@ -921,20 +959,30 @@ class JobManager:
                         cfp.sub_current = int(cur)
                         cfp.sub_total = int(total)
                         if total and cur:
-                            label = (
-                                "Reducing" if unit == "reduce"
-                                else f"Processing {unit}"
-                            )
-                            cfp.last_detail = (
-                                f"{label}: {cur}/{total} "
-                                f"({100 * cur // max(total, 1)}%)"
-                            )
+                            if unit == "reduce":
+                                cfp.last_detail = (
+                                    f"Reducing: {cur}/{total} "
+                                    f"({100 * cur // max(total, 1)}%)"
+                                )
+                            elif unit == "chunk":
+                                cfp.last_detail = (
+                                    f"Processing chunk {cur}/{total} "
+                                    f"({100 * cur // max(total, 1)}%)"
+                                )
+                            else:
+                                cfp.last_detail = (
+                                    f"Processing {unit}: {cur}/{total} "
+                                    f"({100 * cur // max(total, 1)}%)"
+                                )
                         elif total:
-                            label = (
-                                "Reducing" if unit == "reduce"
-                                else f"Processing {unit}"
-                            )
-                            cfp.last_detail = f"{label}: 0/{total} (starting)"
+                            if unit == "reduce":
+                                cfp.last_detail = f"Reducing: starting..."
+                            elif unit == "chunk":
+                                cfp.last_detail = (
+                                    f"Processing chunk 1/{total} (starting)"
+                                )
+                            else:
+                                cfp.last_detail = f"Processing {unit}: 0/{total} (starting)"
                         # Bump per-file percent within the llm_extract
                         # band (35 -> 90).
                         if total:
@@ -952,16 +1000,23 @@ class JobManager:
 
             # Heartbeat thread: ticks every ~5s while client.extract() is
             # running. Two purposes:
-            #   1. Visibility: in single-shot mode there's no chunk
-            #      callback, so without this the UI would just show
-            #      "Calling LLM..." for minutes with no movement. The
-            #      heartbeat updates last_detail to "elapsed: Ns" and
-            #      slowly creeps cfp.percent up within the 35..89 band
-            #      (asymptotic, half-life ~60s).
+            #   1. Visibility: composes a unified "last_detail" line with
+            #      wall-clock elapsed time + chunk-aware context (e.g.
+            #      "Processing chunk 1/7 (chunk elapsed: 142s, total LLM:
+            #      142s)") so the user always sees the worker is alive,
+            #      even between chunk-completion events. Single-shot
+            #      mode shows just "Calling LLM (single-shot)... elapsed:
+            #      Ns".
             #   2. Total-time deadline: if the elapsed time exceeds
             #      cfg.llm.per_file_timeout_seconds, the heartbeat
             #      cancels the LLM client (propagates as LLMCancelled /
             #      LLMTransportError into the extract() call).
+            #
+            # Note: this heartbeat NEVER advances cfp.percent. The chunk
+            # callback advances percent on real signals (chunk completes
+            # or reduce completes); a wall-clock-driven creep would be
+            # misleading (it would race to ~89% in 3 minutes even while
+            # chunk 1 of N is still running).
             llm_started = time.monotonic()
             llm_total_budget_s = float(cfg.llm.per_file_timeout_seconds or 0)
             llm_deadline = (
@@ -975,8 +1030,17 @@ class JobManager:
             }
             HEARTBEAT_INTERVAL_S = 5.0
 
+            def _fmt_secs(s: float) -> str:
+                s = max(0, int(s))
+                if s < 60:
+                    return f"{s}s"
+                m, sec = divmod(s, 60)
+                if m < 60:
+                    return f"{m}m {sec}s"
+                h, m = divmod(m, 60)
+                return f"{h}h {m}m {sec}s"
+
             def _heartbeat_run() -> None:
-                # Local copies (closure-captured) of everything we need.
                 started = llm_started
                 deadline = llm_deadline
                 mode = (
@@ -988,10 +1052,10 @@ class JobManager:
                     # Wait up to HEARTBEAT_INTERVAL_S; wakes early on stop.
                     if heartbeat_stop.wait(timeout=HEARTBEAT_INTERVAL_S):
                         return
-                    elapsed = time.monotonic() - started
-                    elapsed_s = int(elapsed)
+                    now_mono = time.monotonic()
+                    elapsed = now_mono - started
                     # Deadline check first so we surface the cause clearly.
-                    if deadline is not None and time.monotonic() > deadline:
+                    if deadline is not None and now_mono > deadline:
                         log.warning(
                             "LLM total-time budget exceeded for %s "
                             "(%.0fs > %.0fs); cancelling.",
@@ -1007,30 +1071,53 @@ class JobManager:
                         # Stop ticking; the cancel will propagate as an
                         # exception out of client.extract().
                         return
-                    # Asymptotic percent crawl within 35..89 (half-life ~60s).
-                    try:
-                        creep = 1.0 - math.exp(-elapsed / 60.0)
-                    except Exception:
-                        creep = 0.0
-                    pct = min(89, 35 + int(54 * creep))
+
+                    # Compose a chunk/reduce-aware detail line. We do NOT
+                    # touch cfp.percent; that's owned by the chunk
+                    # callback which advances it on real completions.
+                    chunk_started_at = chunk_state.get("chunk_started_at")
+                    reduce_started_at = chunk_state.get("reduce_started_at")
                     with self._lock:
                         cfp = self._state.current_file_progress
                         if cfp is None:
                             return
-                        # Only overwrite last_detail when there's no live
-                        # chunk progress (chunk callback updates that
-                        # field too; we don't want to fight with it).
-                        if cfp.sub_total <= 0:
+                        sub_unit = cfp.sub_unit or ""
+                        sub_current = int(cfp.sub_current)
+                        sub_total = int(cfp.sub_total)
+
+                        if sub_unit == "chunk" and sub_total > 0 \
+                                and chunk_started_at is not None:
+                            chunk_elapsed = now_mono - chunk_started_at
+                            # The chunk currently in flight is sub_current+1
+                            # (the chunk callback only advances sub_current
+                            # AFTER a chunk completes). Cap at sub_total in
+                            # case of a race.
+                            in_flight = min(sub_current + 1, sub_total)
                             cfp.last_detail = (
-                                f"Calling LLM ({mode})... elapsed: {elapsed_s}s"
-                                + (
-                                    f" (budget: {int(llm_total_budget_s)}s)"
-                                    if llm_total_budget_s > 0 and llm_total_budget_s < 1e9
-                                    else ""
-                                )
+                                f"Processing chunk {in_flight}/{sub_total} "
+                                f"(chunk elapsed: {_fmt_secs(chunk_elapsed)}, "
+                                f"total LLM: {_fmt_secs(elapsed)})"
                             )
-                        if pct > cfp.percent:
-                            cfp.percent = pct
+                        elif sub_unit == "reduce" \
+                                and reduce_started_at is not None:
+                            reduce_elapsed = now_mono - reduce_started_at
+                            cfp.last_detail = (
+                                f"Reducing... elapsed: "
+                                f"{_fmt_secs(reduce_elapsed)} "
+                                f"(total LLM: {_fmt_secs(elapsed)})"
+                            )
+                        else:
+                            # Single-shot, or map-reduce before the very
+                            # first chunk callback has fired.
+                            budget_suffix = ""
+                            if llm_total_budget_s > 0 and llm_total_budget_s < 1e9:
+                                budget_suffix = (
+                                    f" (budget: {_fmt_secs(llm_total_budget_s)})"
+                                )
+                            cfp.last_detail = (
+                                f"Calling LLM ({mode})... elapsed: "
+                                f"{_fmt_secs(elapsed)}{budget_suffix}"
+                            )
                     self._broadcast_progress()
 
             heartbeat_thread = threading.Thread(

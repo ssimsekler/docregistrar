@@ -592,9 +592,12 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               {currentProgress.sub_total > 0 && (
                 <div style={{ marginTop: 4 }}>
                   <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
-                    {currentProgress.sub_unit
-                      ? `Reading ${currentProgress.sub_unit}: `
-                      : ""}
+                    {(() => {
+                      const u = currentProgress.sub_unit || "";
+                      if (u === "chunk") return "Processing chunk: ";
+                      if (u === "reduce") return "Reducing: ";
+                      return u ? `Reading ${u}: ` : "";
+                    })()}
                     {currentProgress.sub_current} / {currentProgress.sub_total}
                     {" ("}
                     {Math.round(100 * currentProgress.sub_current / Math.max(currentProgress.sub_total, 1))}
@@ -1563,8 +1566,12 @@ function App() {
               {cfp.sub_total > 0 && (
                 <>
                   {" — "}
-                  {cfp.sub_unit ? `${cfp.sub_unit} ` : ""}
-                  {cfp.sub_current}/{cfp.sub_total}
+                  {(() => {
+                    const u = cfp.sub_unit || "";
+                    if (u === "chunk") return `chunk ${cfp.sub_current}/${cfp.sub_total}`;
+                    if (u === "reduce") return `reducing ${cfp.sub_current}/${cfp.sub_total}`;
+                    return `${u ? u + " " : ""}${cfp.sub_current}/${cfp.sub_total}`;
+                  })()}
                 </>
               )}
             </span>
