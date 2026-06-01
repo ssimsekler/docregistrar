@@ -24,6 +24,19 @@ class KVPair(BaseModel):
 
 MAX_CUSTOM_PROPERTIES = 50
 
+# Maximum number of past errors to retain in extraction_json.error_history.
+MAX_ERROR_HISTORY = 5
+
+# Maximum length (chars) of any single 'error' string we persist on the row.
+MAX_ERROR_TEXT_CHARS = 4000
+
+
+class ErrorEntry(BaseModel):
+    """One historical error attempt for a file."""
+    at: str = ""           # ISO datetime when the error occurred
+    stage: str = ""        # which stage failed (e.g. 'extract_text', 'llm_extract')
+    message: str = ""      # short, human-readable error description
+
 
 class LLMExtraction(BaseModel):
     title: str = ""
@@ -43,11 +56,13 @@ class LLMExtraction(BaseModel):
     geographic_scope: str = ""
     industry_domain: str = ""
     quality_score: float = 0.0              # 0..1, model self-rated
-    repository: str = ""                    # user-assigned, NOT extracted by the LLM
+    repository: str = ""                    # DEPRECATED in JSON: kept for backwards compat;
+                                            # real source of truth is the `repository` column.
     source_url_1: str = ""                  # user-assigned URL references (not extracted by LLM)
     source_url_2: str = ""
     source_url_3: str = ""
     custom_properties: list[KVPair] = Field(default_factory=list)  # user-defined K/V pairs
+    error_history: list[ErrorEntry] = Field(default_factory=list)  # last N error attempts
 
 
 # Set of LLMExtraction fields that count as "generated attributes" (i.e.
@@ -74,17 +89,21 @@ FileStatus = Literal["pending", "processing", "done", "error", "skipped"]
 
 
 class FileRecord(BaseModel):
+    id: str = ""                            # UUID4-equivalent (32 hex chars), DB primary key
     relative_path: str
     relative_folder_path: str = ""          # folder path relative to the repository root ("" for files at the root)
     file_name: str
     extension: str
     file_size: int
     sha256: str
+    repository: str = ""                    # repository this file belongs to (promoted out of extraction_json)
     page_count: Optional[int] = None
     os_created: Optional[str] = None        # ISO datetime
     os_modified: Optional[str] = None
     status: FileStatus = "pending"
     error: str = ""
+    error_count: int = 0                    # consecutive automatic-retry failures (cleared on success / re-eval)
+    last_error_at: Optional[str] = None     # ISO datetime of the most recent error
     indexed_at: Optional[str] = None
     indexing_started_at: Optional[str] = None   # ISO datetime with TZ when processing began
     indexing_completed_at: Optional[str] = None  # ISO datetime with TZ when processing finished

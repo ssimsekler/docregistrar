@@ -101,7 +101,8 @@ def _join(items: list[str] | None) -> str:
 
 def _record_to_row(rec: FileRecord, repo_paths: dict[str, str] | None = None) -> list:
     e = rec.extraction
-    repo_name = e.repository if e else ""
+    # Repository is now a column on FileRecord (was previously inside the JSON).
+    repo_name = rec.repository or ""
     repo_path = ""
     if repo_name and repo_paths is not None:
         repo_path = repo_paths.get(repo_name, "") or ""

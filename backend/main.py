@@ -280,13 +280,7 @@ def _decorate_file_response(rec) -> dict:
     if rec is None:
         return {}
     d = rec.model_dump() if hasattr(rec, "model_dump") else dict(rec)
-    e = d.get("extraction") or {}
-    if isinstance(e, dict):
-        ne = e.get("named_entities") or {}
-    else:
-        e = {}
-        ne = {}
-    repo_name = e.get("repository", "") if isinstance(e, dict) else ""
+    repo_name = d.get("repository", "") or ""
     repo_path = ""
     if repo_name:
         rec_repo = db.get_repository(repo_name)
@@ -319,8 +313,7 @@ def api_files(
     # Pre-fetch repo paths into a lookup to avoid N queries
     repo_map: dict[str, str] = {}
     for r in records:
-        e = r.extraction.model_dump() if r.extraction else {}
-        repo_name = e.get("repository", "") or ""
+        repo_name = r.repository or ""
         if repo_name and repo_name not in repo_map:
             rec_repo = db.get_repository(repo_name)
             repo_map[repo_name] = rec_repo.path if rec_repo else ""
@@ -330,7 +323,7 @@ def api_files(
         d = r.model_dump()
         e = d.pop("extraction", None) or {}
         ne = (e.get("named_entities") or {}) if e else {}
-        repo_name = e.get("repository", "") or ""
+        repo_name = r.repository or ""
         d["title"] = e.get("title", "")
         d["description"] = e.get("description", "")
         d["document_type"] = e.get("document_type", "")
@@ -414,8 +407,7 @@ def _resolve_file_path(rel: str) -> Path:
     if rec is None:
         raise HTTPException(404, f"File not found in registry: {rel}")
 
-    e = rec.extraction.model_dump() if rec.extraction else {}
-    repo_name = (e.get("repository") or "").strip() if isinstance(e, dict) else ""
+    repo_name = (rec.repository or "").strip()
     if not repo_name:
         raise HTTPException(
             400,
