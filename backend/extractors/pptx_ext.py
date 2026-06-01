@@ -2,12 +2,14 @@
 
 Walks every slide, every shape (including grouped), every text frame,
 table cells, slide notes, and core properties. Returns slide count.
+
+Emits per-slide progress via the optional `progress_cb`.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from . import ExtractionResult
+from . import ExtractionResult, ProgressCB, UserSkippedError
 
 
 def _iter_shapes(shapes):
@@ -42,7 +44,18 @@ def _shape_text(shape) -> str:
     return "\n".join(parts)
 
 
-def extract_pptx(path: Path) -> ExtractionResult:
+def _emit(cb: ProgressCB, cur: int, total: int) -> None:
+    if cb is None:
+        return
+    try:
+        cb(cur, total, "slide")
+    except UserSkippedError:
+        raise
+    except Exception:
+        pass
+
+
+def extract_pptx(path: Path, progress_cb: ProgressCB = None) -> ExtractionResult:
     from pptx import Presentation
 
     prs = Presentation(str(path))
@@ -69,6 +82,8 @@ def extract_pptx(path: Path) -> ExtractionResult:
     if cp.revision:
         parts.append(f"Revision (metadata): {cp.revision}")
 
+    _emit(progress_cb, 0, slide_count)
+
     for idx, slide in enumerate(prs.slides, 1):
         slide_lines: list[str] = [f"--- Slide {idx} ---"]
         for shape in _iter_shapes(slide.shapes):
@@ -86,6 +101,8 @@ def extract_pptx(path: Path) -> ExtractionResult:
 
         if len(slide_lines) > 1:
             parts.append("\n".join(slide_lines))
+
+        _emit(progress_cb, idx, slide_count)
 
     text = "\n\n".join(parts).strip()
     return ExtractionResult(text=text, page_count=slide_count)

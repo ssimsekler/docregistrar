@@ -24,7 +24,11 @@ from .config import (
 )
 from .db import Database
 from .excel_writer import write_registry
-from .extractors import extract_any, truncate_head_middle_tail
+from .extractors import (
+    UserSkippedError,
+    extract_any,
+    truncate_head_middle_tail,
+)
 from .llm import (
     LLMCancelled,
     LLMError,
@@ -115,6 +119,9 @@ class JobManager:
 
     def add_listener(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=500)
+        # Each listener gets a default `subscribed_repository = None` (= all repos).
+        # The frontend can override this via the WebSocket `subscribe` message.
+        q.subscribed_repository = None  # type: ignore[attr-defined]
         self._listeners.append(q)
         return q
 
@@ -124,10 +131,35 @@ class JobManager:
         except ValueError:
             pass
 
-    def snapshot(self) -> ProgressSnapshot:
+    def set_listener_repository(self, q: asyncio.Queue, repository: Optional[str]) -> None:
+        """Update which repository's stats this listener wants. Pass None
+        to subscribe to global stats."""
+        try:
+            q.subscribed_repository = repository  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def snapshot(self, repository: Optional[str] = None) -> ProgressSnapshot:
+        """Return a progress snapshot.
+
+        `repository` semantics:
+          - None  : global counts (legacy behavior)
+          - ""    : files with no repository assigned
+          - "X"   : counts for that repository
+
+        While a run is in progress, the active run's repository takes
+        precedence over `repository` so all listeners see what's actually
+        being processed.
+        """
         with self._lock:
-            counts = self.db.counts_by_status()
-            total = self.db.total_count()
+            # Active run: force the snapshot to the run's repo so listeners
+            # always see the work happening, regardless of their subscription.
+            scope = repository
+            if self._state.state in ("running", "scanning", "paused", "stopping") \
+                    and self._state.repository:
+                scope = self._state.repository
+            counts = self.db.counts_by_status(scope)
+            total = self.db.total_count(scope)
             cfp_obj = None
             cfp = self._state.current_file_progress
             if cfp is not None:
@@ -652,7 +684,47 @@ class JobManager:
         try:
             self._begin_step("extract_text", percent=5,
                              detail=f"Reading {rec.extension} file ({_fmt_size(rec.file_size)})...")
-            res = extract_any(path, rec.extension)
+
+            # Per-page progress callback. Throttle to once every ~250 ms so a
+            # 500-page PDF doesn't flood the WebSocket. Also raise
+            # UserSkippedError if the user asked to skip mid-extraction.
+            last_emit = [0.0]
+            EMIT_THROTTLE_S = 0.25
+
+            def _on_extract_progress(cur: int, total: int, unit: str) -> None:
+                if self._consume_skip_signal(rec.relative_path):
+                    raise UserSkippedError("user skip")
+                now = time.monotonic()
+                if cur != total and (now - last_emit[0]) < EMIT_THROTTLE_S:
+                    return
+                last_emit[0] = now
+                pct = 5 + int(25 * cur / total) if total else 5
+                if total:
+                    self._set_detail(
+                        f"Reading {unit}: {cur}/{total} ({100 * cur // total}%)"
+                    )
+                else:
+                    self._set_detail(f"Reading {unit}: {cur}")
+                # Bump per-file progress percent within the extract_text band.
+                with self._lock:
+                    cfp = self._state.current_file_progress
+                    if cfp is not None and pct > cfp.percent:
+                        cfp.percent = pct
+
+            try:
+                res = extract_any(path, rec.extension, progress_cb=_on_extract_progress)
+            except UserSkippedError:
+                self._end_step("extract_text", percent=10, detail="skipped by user (mid-extraction)")
+                self.db.mark_status(
+                    rec.relative_path, "skipped",
+                    "Skipped by user during processing.",
+                    repository=rec.repository,
+                )
+                self._set_message(
+                    f"Skipped (user request) during extract_text: {rec.relative_path}"
+                )
+                self._end_file()
+                return True
 
             if self._consume_skip_signal(rec.relative_path):
                 self._end_step("extract_text", percent=10, detail="skipped by user")
@@ -992,11 +1064,28 @@ class JobManager:
         self._broadcast_progress()
 
     def _broadcast_progress(self) -> None:
+        """Push a progress event to every WebSocket listener, scoped to that
+        listener's subscribed repository (set via `set_listener_repository`).
+
+        While a run is in progress, snapshot() forces the scope to the active
+        run's repo so all listeners see what's actually being processed.
+        """
         if self._loop is None:
             return
-        snap = self.snapshot().model_dump()
-        payload = {"type": "progress", "data": snap}
+        # Compute the global snapshot once; reuse it for listeners that didn't
+        # subscribe to a specific repo.
+        global_snap = self.snapshot().model_dump()
+        # Cache scoped snapshots by repository so we don't re-query the DB
+        # once per listener with the same subscription.
+        scoped_cache: dict[Optional[str], dict] = {None: global_snap}
         for q in list(self._listeners):
+            sub = getattr(q, "subscribed_repository", None)
+            if sub not in scoped_cache:
+                try:
+                    scoped_cache[sub] = self.snapshot(repository=sub).model_dump()
+                except Exception:
+                    scoped_cache[sub] = global_snap
+            payload = {"type": "progress", "data": scoped_cache[sub]}
             try:
                 self._loop.call_soon_threadsafe(_safe_put, q, payload)
             except RuntimeError:

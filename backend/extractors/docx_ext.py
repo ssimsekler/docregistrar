@@ -2,15 +2,28 @@
 
 Includes paragraphs, table cells, and footers (so we can pick up
 'Confidential' / 'Internal' markers commonly placed in footers).
+
+Emits progress every ~100 paragraphs via the optional `progress_cb`.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from . import ExtractionResult
+from . import ExtractionResult, ProgressCB, UserSkippedError
 
 
-def extract_docx(path: Path) -> ExtractionResult:
+def _emit(cb: ProgressCB, cur: int, total: int) -> None:
+    if cb is None:
+        return
+    try:
+        cb(cur, total, "paragraph")
+    except UserSkippedError:
+        raise
+    except Exception:
+        pass
+
+
+def extract_docx(path: Path, progress_cb: ProgressCB = None) -> ExtractionResult:
     from docx import Document
 
     try:
@@ -26,11 +39,16 @@ def extract_docx(path: Path) -> ExtractionResult:
 
     parts: list[str] = []
 
-    # Body paragraphs
-    for p in doc.paragraphs:
+    # Body paragraphs (emit progress every 100 to keep websocket noise sane)
+    paragraphs = list(doc.paragraphs)
+    total_p = len(paragraphs)
+    _emit(progress_cb, 0, total_p)
+    for i, p in enumerate(paragraphs, 1):
         t = (p.text or "").strip()
         if t:
             parts.append(t)
+        if i == total_p or (i % 100) == 0:
+            _emit(progress_cb, i, total_p)
 
     # Tables
     for tbl in doc.tables:

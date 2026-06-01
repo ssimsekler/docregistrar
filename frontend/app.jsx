@@ -572,8 +572,21 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
         <div className="detail-body">
           {isCurrent && currentProgress && !editing && (
             <div className="card live">
-              <div className="card-title">
-                ⚙️ Processing — {currentProgress.percent}% ({fmtMs(currentProgress.elapsed_ms)} elapsed)
+              <div className="card-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span>⚙️ Processing — {currentProgress.percent}% ({fmtMs(currentProgress.elapsed_ms)} elapsed)</span>
+                <button
+                  className="danger"
+                  style={{ marginLeft: "auto" }}
+                  title="Skip this file. Processing stops at the next safe checkpoint and the file is marked as 'skipped'."
+                  onClick={async () => {
+                    try {
+                      await api("POST", "/api/file/skip-current", { relative_path: relativePath });
+                    } catch (err) {
+                      alert(`Could not skip:\n${err.message}`);
+                    }
+                  }}>
+                  ⏭ Skip current
+                </button>
               </div>
               <div className="mini-progress"><div style={{width: `${currentProgress.percent}%`}} /></div>
               <div className="step-list">
@@ -627,7 +640,46 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             <PropRow label="Used thinking" value={rec.used_thinking ? "Yes" : "No"} />
             <PropRow label="Manually edited" value={rec.manually_edited ? "Yes" : "No"} />
             <PropRow label="Is duplicate" value={rec.is_duplicate ? "Yes" : "No"} />
+            {rec.error_count > 0 && (
+              <>
+                <PropRow label="Failed attempts" value={rec.error_count} />
+                <PropRow label="Last error at" value={rec.last_error_at} />
+              </>
+            )}
           </div>
+
+          {Array.isArray(e.error_history) && e.error_history.length > 0 && (
+            <div className="card">
+              <details>
+                <summary
+                  className="card-title"
+                  style={{ cursor: "pointer", listStyle: "revert" }}
+                  title="Last few extraction/LLM errors for this file. Click to expand."
+                >
+                  ⚠️ Recent errors ({e.error_history.length} of last {5})
+                </summary>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+                  {[...e.error_history].reverse().map((err, i) => (
+                    <div key={i} style={{
+                      fontFamily: "ui-monospace,Menlo,Consolas,monospace",
+                      fontSize: 11,
+                      padding: 6,
+                      border: "1px solid var(--border)",
+                      borderRadius: 4,
+                      background: "var(--panel)",
+                    }}>
+                      <div className="muted" style={{ fontSize: 10, marginBottom: 2 }}>
+                        {err.at} {err.stage && <>· stage: <b>{err.stage}</b></>}
+                      </div>
+                      <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                        {err.message}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            </div>
+          )}
 
           {rec.is_duplicate && (
             <div className="card">
@@ -1155,6 +1207,13 @@ function App() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
     wsRef.current = ws;
+    ws.onopen = () => {
+      // Initial subscription. Reflects whatever repo the user starts with;
+      // a separate effect re-subscribes whenever the selection changes.
+      try {
+        ws.send(JSON.stringify({ type: "subscribe", repository: repository || null }));
+      } catch {}
+    };
     ws.onmessage = (ev) => {
       try {
         const m = JSON.parse(ev.data);
@@ -1190,6 +1249,16 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Re-subscribe over WebSocket whenever the selected repo changes,
+  // so the header counts immediately follow the user's selection.
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: "subscribe", repository: repository || null }));
+    } catch {}
+  }, [repository]);
+
   const refreshFiles = useCallback(async () => {
     try {
       const params = new URLSearchParams();
@@ -1215,13 +1284,18 @@ function App() {
     let aborted = false;
     const tickProgress = async () => {
       try {
-        const p = await api("GET", "/api/progress");
+        // Scope the polled progress to the user's selected repo so the
+        // 3-second poll doesn't clobber the (correctly scoped) WebSocket
+        // pushes whenever the user has picked a repository.
+        const qs = new URLSearchParams();
+        qs.set("repository", (repository || "").trim());
+        const p = await api("GET", `/api/progress?${qs.toString()}`);
         if (!aborted) setProgress(p);
       } catch { /* ignore */ }
     };
     const id = setInterval(tickProgress, 3000);
     return () => { aborted = true; clearInterval(id); };
-  }, []);
+  }, [repository]);
 
   // Actions
   const onStart = async () => {

@@ -3,12 +3,28 @@
 Each extractor returns an ExtractionResult with:
   - text: concatenated plain text (caller will apply head/middle/tail truncation)
   - page_count: int or None
+
+Extractors that loop over pages/slides/sheets accept an optional
+`progress_cb(current, total, unit)` callback to surface live progress
+to the caller (e.g. JobManager). The callback may raise
+`UserSkippedError` to abort extraction cleanly.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+# A progress callback. Called with (current, total, unit_label).
+# `unit_label` is e.g. "page", "slide", "sheet". The callback may raise
+# UserSkippedError to abort the extractor mid-loop.
+ProgressCB = Optional[Callable[[int, int, str], None]]
+
+
+class UserSkippedError(Exception):
+    """Raised by a progress callback to abort extraction cleanly because
+    the user requested a skip."""
+    pass
 
 
 @dataclass
@@ -18,28 +34,49 @@ class ExtractionResult:
     extraction_error: str = ""
 
 
-def extract_any(path: Path, ext: str) -> ExtractionResult:
-    """Dispatch to the right extractor by file extension (lowercase, with dot)."""
+def extract_any(path: Path, ext: str,
+                progress_cb: ProgressCB = None) -> ExtractionResult:
+    """Dispatch to the right extractor by file extension (lowercase, with dot).
+
+    Re-raises UserSkippedError so the caller can distinguish a user-initiated
+    skip from a genuine extraction error.
+    """
     ext = ext.lower()
     try:
         if ext == ".pdf":
             from .pdf import extract_pdf
-            return extract_pdf(path)
+            return extract_pdf(path, progress_cb=progress_cb)
         if ext == ".docx":
             from .docx_ext import extract_docx
-            return extract_docx(path)
+            return extract_docx(path, progress_cb=progress_cb)
         if ext == ".pptx":
             from .pptx_ext import extract_pptx
-            return extract_pptx(path)
+            return extract_pptx(path, progress_cb=progress_cb)
         if ext == ".xlsx":
             from .xlsx_ext import extract_xlsx
-            return extract_xlsx(path)
+            return extract_xlsx(path, progress_cb=progress_cb)
         if ext in {".txt", ".md", ".rtf"}:
             from .text import extract_text
-            return extract_text(path)
+            res = extract_text(path)
+            if progress_cb is not None:
+                try:
+                    progress_cb(1, 1, "file")
+                except UserSkippedError:
+                    raise
+                except Exception:
+                    pass
+            return res
         if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}:
             from .image import extract_image
-            return extract_image(path)
+            res = extract_image(path)
+            if progress_cb is not None:
+                try:
+                    progress_cb(1, 1, "image")
+                except UserSkippedError:
+                    raise
+                except Exception:
+                    pass
+            return res
         if ext in {".doc", ".ppt", ".xls"}:
             # Legacy formats: filename only (no parser without paid add-ons).
             return ExtractionResult(
@@ -47,6 +84,8 @@ def extract_any(path: Path, ext: str) -> ExtractionResult:
                 page_count=None,
                 extraction_error="legacy_format_unsupported",
             )
+    except UserSkippedError:
+        raise
     except Exception as e:
         return ExtractionResult(text="", page_count=None, extraction_error=f"{type(e).__name__}: {e}")
     return ExtractionResult(text="", page_count=None, extraction_error="unsupported_extension")

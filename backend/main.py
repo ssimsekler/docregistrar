@@ -125,8 +125,12 @@ def api_pick_folder():
 
 
 @app.get("/api/progress")
-def api_progress():
-    return job.snapshot().model_dump()
+def api_progress(repository: str | None = None):
+    """Return a progress snapshot. If `repository` is provided, the counts
+    are scoped to that repository (use empty string to scope to files with
+    no repository assigned). During an active run, the active run's
+    repository takes precedence."""
+    return job.snapshot(repository=repository).model_dump()
 
 
 @app.post("/api/start")
@@ -423,6 +427,20 @@ def api_skip_dup_siblings(body: SkipDupSiblingsRequest):
     return {"updated": n}
 
 
+@app.post("/api/file/skip-current")
+def api_file_skip_current(req: OpenFileRequest):
+    """Signal the worker to skip the file currently being processed.
+    The worker will mark it as 'skipped' once it reaches the next checkpoint
+    (extractor page boundary, or after the in-flight LLM request is cancelled).
+    """
+    rel = (req.relative_path or "").strip()
+    if not rel:
+        raise HTTPException(400, "relative_path is required")
+    job.signal_skip(rel)
+    job.broadcast_progress()
+    return {"ok": True, "skipping": rel}
+
+
 @app.post("/api/files/delete")
 def api_files_delete(body: DeleteFilesRequest):
     """Permanently remove the given files from the registry."""
@@ -576,10 +594,46 @@ async def ws_endpoint(ws: WebSocket):
         await ws.send_text(json.dumps({"type": "progress", "data": job.snapshot().model_dump()}))
     except Exception:
         pass
-    try:
+
+    # Coroutine that receives client messages (subscriptions) concurrently
+    # with the outbound progress stream.
+    async def _recv_loop() -> None:
         while True:
-            msg = await q.get()
-            await ws.send_text(json.dumps(msg))
+            try:
+                msg_text = await ws.receive_text()
+            except WebSocketDisconnect:
+                raise
+            except Exception:
+                return
+            try:
+                msg = json.loads(msg_text)
+            except Exception:
+                continue
+            if isinstance(msg, dict) and msg.get("type") == "subscribe":
+                # `repository` may be None / omitted (= all repos) or a string.
+                repo = msg.get("repository")
+                if repo is None or isinstance(repo, str):
+                    job.set_listener_repository(q, repo)
+                    # Send an immediate scoped snapshot so the UI updates fast.
+                    try:
+                        snap = job.snapshot(repository=repo).model_dump()
+                        await ws.send_text(json.dumps({"type": "progress", "data": snap}))
+                    except Exception:
+                        pass
+
+    async def _send_loop() -> None:
+        while True:
+            payload = await q.get()
+            await ws.send_text(json.dumps(payload))
+
+    recv_task = asyncio.create_task(_recv_loop())
+    send_task = asyncio.create_task(_send_loop())
+    try:
+        done, pending = await asyncio.wait(
+            {recv_task, send_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
     except WebSocketDisconnect:
         pass
     except asyncio.CancelledError:
@@ -587,6 +641,9 @@ async def ws_endpoint(ws: WebSocket):
     except Exception as e:
         log.warning("WebSocket error: %s", e)
     finally:
+        for t in (recv_task, send_task):
+            if not t.done():
+                t.cancel()
         job.remove_listener(q)
         try:
             await ws.close()

@@ -5,12 +5,14 @@ sane:
   - All sheet names
   - For each sheet: header row + first ~30 rows + last ~5 rows
   - Workbook core properties (title, author, etc.)
+
+Emits per-sheet progress via the optional `progress_cb`.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from . import ExtractionResult
+from . import ExtractionResult, ProgressCB, UserSkippedError
 
 MAX_ROWS_PER_SHEET = 30
 MAX_TAIL_ROWS = 5
@@ -30,7 +32,18 @@ def _row_to_text(row) -> str:
     return s
 
 
-def extract_xlsx(path: Path) -> ExtractionResult:
+def _emit(cb: ProgressCB, cur: int, total: int) -> None:
+    if cb is None:
+        return
+    try:
+        cb(cur, total, "sheet")
+    except UserSkippedError:
+        raise
+    except Exception:
+        pass
+
+
+def extract_xlsx(path: Path, progress_cb: ProgressCB = None) -> ExtractionResult:
     from openpyxl import load_workbook
 
     wb = load_workbook(filename=str(path), read_only=True, data_only=True)
@@ -60,7 +73,10 @@ def extract_xlsx(path: Path) -> ExtractionResult:
     sheet_names = wb.sheetnames
     parts.append(f"Sheets: {', '.join(sheet_names)} (count={len(sheet_names)})")
 
-    for name in sheet_names:
+    total_sheets = len(sheet_names)
+    _emit(progress_cb, 0, total_sheets)
+
+    for sheet_idx, name in enumerate(sheet_names, 1):
         ws = wb[name]
         parts.append(f"\n--- Sheet: {name} ---")
 
@@ -84,6 +100,8 @@ def extract_xlsx(path: Path) -> ExtractionResult:
             parts.extend(head_rows)
         if all_rows_seen > MAX_ROWS_PER_SHEET:
             parts.append(f"[... {all_rows_seen - MAX_ROWS_PER_SHEET} more rows omitted ...]")
+
+        _emit(progress_cb, sheet_idx, total_sheets)
 
     wb.close()
 
