@@ -23,6 +23,7 @@ log = logging.getLogger("docregistrar.excel")
 SHEET_NAME = "Documents"
 
 COLUMNS: list[tuple[str, int]] = [
+    ("ID", 36),
     ("File name", 30),
     ("Relative path", 50),
     ("Repository path", 60),
@@ -107,6 +108,7 @@ def _record_to_row(rec: FileRecord, repo_paths: dict[str, str] | None = None) ->
     if repo_name and repo_paths is not None:
         repo_path = repo_paths.get(repo_name, "") or ""
     return [
+        rec.id or "",
         rec.file_name,
         rec.relative_path,
         repo_path,

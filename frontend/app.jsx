@@ -592,6 +592,7 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
           {/* File-system / computed (read-only) */}
           <div className="card">
             <div className="card-title">File (read-only)</div>
+            <PropRow label="ID" value={rec.id} />
             {editing ? (
               <div className="prop-row">
                 <div className="prop-label">Status</div>
