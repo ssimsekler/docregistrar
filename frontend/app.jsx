@@ -764,6 +764,302 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
 }
 
 // ---------- main app ----------
+
+// ---------- Settings dialog ----------
+// Modal that lets users edit runtime settings (LLM, processing, scanner, …).
+// Calls GET/PUT/DELETE /api/settings; values immediately picked up by the
+// worker on its next loop iteration.
+const SETTINGS_GROUPS = [
+  {
+    name: "LLM",
+    keys: [
+      "llm.base_url",
+      "llm.api_key",
+      "llm.model",
+      "llm.request_timeout_seconds",
+      "llm.temperature",
+      "llm.top_p",
+      "llm.top_k",
+      "llm.presence_penalty",
+      "llm.thinking_default",
+      "llm.thinking_on_low_quality",
+      "llm.low_quality_threshold",
+      "llm.max_output_tokens",
+    ],
+  },
+  {
+    name: "Processing",
+    keys: ["processing.max_error_retries", "excel_write_every_n_files"],
+  },
+  {
+    name: "Text extraction",
+    keys: [
+      "extract.head_chars",
+      "extract.middle_chars",
+      "extract.tail_chars",
+      "extract.max_file_size_bytes",
+    ],
+  },
+  {
+    name: "Scanner",
+    keys: ["include_extensions", "ignore_dir_names"],
+  },
+  {
+    name: "Storage",
+    keys: ["registry_xlsx"],
+  },
+  {
+    name: "Server (restart required)",
+    keys: ["server.host", "server.port"],
+  },
+];
+
+const SETTINGS_HELP = {
+  "llm.base_url": "OpenAI-compatible LLM endpoint URL (e.g. LM Studio).",
+  "llm.api_key": "Bearer token. LM Studio ignores the value but the field is required.",
+  "llm.model": "Exact model identifier loaded in your LLM server.",
+  "llm.request_timeout_seconds":
+    "HTTP timeout (seconds) for the entire LLM request. Set by this app, not by LM Studio.",
+  "llm.temperature": "Sampling temperature (0–2). Lower = more deterministic.",
+  "llm.top_p": "Nucleus sampling threshold (0–1).",
+  "llm.top_k": "Top-K sampling cutoff (defined but not currently sent in requests).",
+  "llm.presence_penalty":
+    "Defined but not currently sent (some LLM backends reject it).",
+  "llm.thinking_default":
+    "If on, the first-pass LLM call uses thinking mode (slower, smarter).",
+  "llm.thinking_on_low_quality":
+    "If on, automatically retry with thinking ON when quality_score is below the threshold.",
+  "llm.low_quality_threshold": "Quality threshold (0–1) that triggers a thinking-mode rerun.",
+  "llm.max_output_tokens": "Max tokens the LLM may produce per call.",
+  "processing.max_error_retries":
+    "After this many consecutive failures, the file is no longer auto-retried. Set its status to 'pending' or Re-evaluate to clear the counter.",
+  "excel_write_every_n_files":
+    "Refresh the on-disk registry.xlsx after this many files complete (and at end of run).",
+  "extract.head_chars": "Characters from the start of the document sent to the LLM.",
+  "extract.middle_chars": "Characters sampled from the document's middle.",
+  "extract.tail_chars": "Characters from the end of the document sent to the LLM.",
+  "extract.max_file_size_bytes":
+    "Skip files bigger than this many bytes during scan. 0 = no limit.",
+  "include_extensions":
+    "List of file extensions (one per line) the scanner considers. Each entry should start with a dot.",
+  "ignore_dir_names":
+    "Folders to skip during scan (case-insensitive, one per line).",
+  "registry_xlsx":
+    "Where to write the registry Excel file. Empty = <repository path>/registry.xlsx.",
+  "server.host": "Bind address. Editable in config.yaml only; restart required.",
+  "server.port": "TCP port. Editable in config.yaml only; restart required.",
+};
+
+function _settingType(key, value) {
+  if (Array.isArray(value)) return "list";
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return "number";
+  return "string";
+}
+
+function SettingsDialog({ open, onClose }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  // Local drafts keyed by setting key (only for fields the user has touched).
+  const [drafts, setDrafts] = useState({});
+  const [savingKey, setSavingKey] = useState("");
+
+  const refresh = useCallback(async () => {
+    setLoading(true); setErr("");
+    try {
+      const r = await api("GET", "/api/settings");
+      setData(r);
+      setDrafts({});
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { if (open) refresh(); }, [open, refresh]);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const isOverridden = (key) => data?.overridden_keys?.includes(key);
+  const isRestartRequired = (key) => data?.restart_required_keys?.includes(key);
+  const currentVal = (key) => data?.current?.[key];
+  const defaultVal = (key) => data?.defaults?.[key];
+
+  const draftValueOrCurrent = (key) => {
+    if (key in drafts) return drafts[key];
+    return currentVal(key);
+  };
+
+  const setDraft = (key, val) => {
+    setDrafts(prev => ({ ...prev, [key]: val }));
+  };
+
+  const coerce = (key, raw) => {
+    const t = _settingType(key, currentVal(key));
+    if (t === "bool") return !!raw;
+    if (t === "number") {
+      const n = Number(raw);
+      if (Number.isNaN(n)) throw new Error("Not a valid number");
+      return n;
+    }
+    if (t === "list") {
+      if (Array.isArray(raw)) return raw;
+      // Multi-line input → trimmed non-empty entries.
+      return String(raw).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    }
+    return String(raw ?? "");
+  };
+
+  const saveSetting = async (key) => {
+    if (isRestartRequired(key)) {
+      alert("This setting can only be changed by editing config.yaml and restarting the application.");
+      return;
+    }
+    setSavingKey(key); setErr("");
+    try {
+      const value = coerce(key, draftValueOrCurrent(key));
+      const r = await api("PUT", "/api/settings", { key, value });
+      setData(r);
+      setDrafts(prev => { const c = { ...prev }; delete c[key]; return c; });
+    } catch (e) { setErr(`${key}: ${e.message}`); }
+    finally { setSavingKey(""); }
+  };
+
+  const resetSetting = async (key) => {
+    if (isRestartRequired(key)) return;
+    setSavingKey(key); setErr("");
+    try {
+      const r = await api("DELETE", `/api/settings/${encodeURIComponent(key)}`);
+      setData(r);
+      setDrafts(prev => { const c = { ...prev }; delete c[key]; return c; });
+    } catch (e) { setErr(`${key}: ${e.message}`); }
+    finally { setSavingKey(""); }
+  };
+
+  const resetAll = async () => {
+    if (!confirm("Reset ALL settings to their defaults? This drops every override stored in the database.")) return;
+    setLoading(true); setErr("");
+    try {
+      const r = await api("POST", "/api/settings/reset-all");
+      setData(r);
+      setDrafts({});
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  };
+
+  const renderInput = (key) => {
+    const cur = currentVal(key);
+    const draft = draftValueOrCurrent(key);
+    const t = _settingType(key, cur);
+    const disabled = isRestartRequired(key);
+    if (t === "bool") {
+      return (
+        <input type="checkbox" className="checkbox"
+          disabled={disabled}
+          checked={!!draft}
+          onChange={e => setDraft(key, e.target.checked)} />
+      );
+    }
+    if (t === "list") {
+      const text = Array.isArray(draft) ? draft.join("\n") : String(draft || "");
+      return (
+        <textarea rows={6} disabled={disabled}
+          style={{ width: "100%", fontFamily: "ui-monospace,Menlo,Consolas,monospace", fontSize: 12 }}
+          value={text}
+          onChange={e => setDraft(key, e.target.value)} />
+      );
+    }
+    return (
+      <input type={t === "number" ? "number" : "text"} disabled={disabled}
+        value={draft ?? ""}
+        onChange={e => setDraft(key, e.target.value)}
+        style={{ width: "100%" }} />
+    );
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal modal-wide" onClick={e => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>⚙️ Settings</h3>
+          <button className="modal-close" onClick={onClose} title="Close (Esc)">✕</button>
+        </div>
+        <div className="modal-body">
+          {loading && !data && <div className="repo-empty">Loading…</div>}
+          {err && <div className="error-text" style={{ marginBottom: 8 }}>Error: {err}</div>}
+          {data && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {SETTINGS_GROUPS.map(group => (
+                <div key={group.name} className="card">
+                  <div className="card-title">{group.name}</div>
+                  {group.keys.map(key => {
+                    const overridden = isOverridden(key);
+                    const restart = isRestartRequired(key);
+                    const dirty = key in drafts;
+                    return (
+                      <div className="prop-row" key={key} style={{ alignItems: "flex-start" }}>
+                        <div className="prop-label" style={{ minWidth: 220 }}>
+                          <div style={{ fontFamily: "ui-monospace,Menlo,Consolas,monospace", fontSize: 12 }}>
+                            {key}
+                            {overridden && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(modified)</span>}
+                            {restart && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(restart required)</span>}
+                          </div>
+                          {SETTINGS_HELP[key] && (
+                            <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{SETTINGS_HELP[key]}</div>
+                          )}
+                        </div>
+                        <div className="prop-value" style={{ flex: 1 }}>
+                          {renderInput(key)}
+                          <div style={{ display: "flex", gap: 6, marginTop: 4, alignItems: "center" }}>
+                            {!restart && (
+                              <button className="primary"
+                                      disabled={!dirty || savingKey === key}
+                                      onClick={() => saveSetting(key)}
+                                      title="Save this setting">
+                                💾 Save
+                              </button>
+                            )}
+                            {overridden && !restart && (
+                              <button onClick={() => resetSetting(key)}
+                                      disabled={savingKey === key}
+                                      title={`Reset to default (${JSON.stringify(defaultVal(key))})`}>
+                                🔄 Reset
+                              </button>
+                            )}
+                            {dirty && (
+                              <span className="muted" style={{ fontSize: 11 }}>unsaved</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="modal-foot">
+          <button onClick={resetAll} title="Drop all overrides; revert every field to its YAML/default value.">
+            🔄 Reset all to defaults
+          </button>
+          <span className="muted" style={{ marginLeft: "auto", fontSize: 12 }}>
+            Changes take effect on the worker's next loop iteration. Server settings need a restart.
+          </span>
+          <button onClick={onClose} title="Close">Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ---------- main app ----------
 function App() {
   const [config, setConfig] = useState(null);
   const [progress, setProgress] = useState({
@@ -791,6 +1087,7 @@ function App() {
   const [bulkStatus, setBulkStatus] = useState("");
   const [repoMgrOpen, setRepoMgrOpen] = useState(false);
   const [bulkRepoMgrOpen, setBulkRepoMgrOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [rightWidth, setRightWidth] = useState(() => {
     const saved = parseInt(localStorage.getItem("docregistrar.rightWidth") || "", 10);
     if (!Number.isNaN(saved) && saved >= 280 && saved <= 1600) return saved;
@@ -1119,6 +1416,10 @@ function App() {
           <button onClick={onDownload} title="Download current registry as Excel">
             ⬇ Download .xlsx
           </button>
+          <button onClick={() => setSettingsOpen(true)}
+                  title="Open the settings dialog (LLM, processing, scanner, …)">
+            ⚙️ Settings
+          </button>
         </div>
 
         <div className="progress-bar"><div style={{ width: `${pct}%` }}></div></div>
@@ -1390,6 +1691,10 @@ function App() {
         }}
         onChanged={() => { refreshRepositories(); refreshFiles(); }}
         onClose={() => setBulkRepoMgrOpen(false)}
+      />
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   );

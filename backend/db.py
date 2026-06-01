@@ -860,24 +860,43 @@ class Database:
                 n += 1
         return n
 
-    def next_pending(self, *, max_error_retries: int = 2) -> Optional[FileRecord]:
+    def next_pending(self, *, max_error_retries: int = 5,
+                     repository: Optional[str] = None) -> Optional[FileRecord]:
         """Return the next file the worker should process.
 
         Priority:
-          1. status='pending' rows
-          2. then status='error' rows whose error_count < max_error_retries
+          1. status='pending' rows (oldest path first)
+          2. then status='error' rows whose error_count < max_error_retries,
+             ordered by error_count ASC (least-failed first), then last_error_at
+             ASC (oldest first within the same retry tier).
+
+        If `repository` is given, the search is scoped to that repository.
         """
         with self.conn() as c:
+            params: list[Any] = []
+            repo_clause = ""
+            if repository is not None:
+                repo_clause = "AND repository=?"
+                params.append(repository)
+
             row = c.execute(
-                "SELECT * FROM files WHERE status='pending' "
-                "ORDER BY relative_path LIMIT 1"
+                f"SELECT * FROM files WHERE status='pending' {repo_clause} "
+                f"ORDER BY relative_path LIMIT 1",
+                params,
             ).fetchone()
             if row is not None:
                 return _row_to_record(row)
+
+            err_params = list(params) + [int(max_error_retries)]
             row = c.execute(
-                "SELECT * FROM files WHERE status='error' AND error_count < ? "
-                "ORDER BY relative_path LIMIT 1",
-                (int(max_error_retries),),
+                f"""SELECT * FROM files
+                      WHERE status='error' {repo_clause}
+                        AND error_count < ?
+                      ORDER BY error_count ASC,
+                               COALESCE(last_error_at, '') ASC,
+                               relative_path
+                      LIMIT 1""",
+                err_params,
             ).fetchone()
             return _row_to_record(row) if row else None
 
@@ -1071,16 +1090,40 @@ class Database:
             ).fetchall()
             return [_row_to_record(r) for r in rows]
 
-    def counts_by_status(self) -> dict[str, int]:
+    def counts_by_status(self, repository: Optional[str] = None) -> dict[str, int]:
+        """Counts grouped by status.
+
+        `repository` semantics:
+          - None : all repositories (legacy behavior).
+          - ""   : only files with no repository assigned.
+          - "X"  : only files in that repository.
+        """
         with self.conn() as c:
-            rows = c.execute(
-                "SELECT status, COUNT(*) AS n FROM files GROUP BY status"
-            ).fetchall()
+            if repository is None:
+                rows = c.execute(
+                    "SELECT status, COUNT(*) AS n FROM files GROUP BY status"
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT status, COUNT(*) AS n FROM files "
+                    "WHERE repository=? GROUP BY status",
+                    (repository,),
+                ).fetchall()
             return {r["status"]: r["n"] for r in rows}
 
-    def total_count(self) -> int:
+    def total_count(self, repository: Optional[str] = None) -> int:
+        """Total file count.
+
+        `repository` semantics match `counts_by_status`.
+        """
         with self.conn() as c:
-            row = c.execute("SELECT COUNT(*) AS n FROM files").fetchone()
+            if repository is None:
+                row = c.execute("SELECT COUNT(*) AS n FROM files").fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM files WHERE repository=?",
+                    (repository,),
+                ).fetchone()
             return int(row["n"]) if row else 0
 
     def delete_files_not_in(self, present_paths: set[str]) -> int:

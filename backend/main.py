@@ -31,6 +31,7 @@ from .schemas import (
     SkipDupSiblingsRequest,
     StartRequest,
 )
+from .settings import SettingsService
 
 # Extensions blocked by POST /api/open-file.
 BLOCKED_OPEN_EXTENSIONS = {
@@ -54,7 +55,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 db = Database(DATA_DIR / "state.db")
-job = JobManager(cfg, db, DATA_DIR)
+settings = SettingsService(db)
+# Effective config = defaults ⊕ YAML ⊕ DB overrides. Apply once at boot.
+cfg = settings.effective_config()
+job = JobManager(cfg, db, DATA_DIR, settings=settings)
 
 app = FastAPI(title="docregistrar", version="0.3.0")
 
@@ -213,6 +217,54 @@ def api_delete_repository(name: str):
         raise HTTPException(404, str(e))
     job.broadcast_progress()
     return {"deleted": True, "files_cleared": n}
+
+
+# -------- Settings (runtime config overrides) --------
+
+class SettingsUpdateRequest(BaseModel):
+    key: str
+    value: object  # any JSON-compatible value; SettingsService validates
+
+
+@app.get("/api/settings")
+def api_settings_get():
+    """Return the merged settings view (defaults + YAML + DB overrides) plus
+    metadata the UI needs to render the Settings modal."""
+    return settings.to_dict_view()
+
+
+@app.put("/api/settings")
+def api_settings_set(body: SettingsUpdateRequest):
+    """Persist a single dotted-key override. Validates by trying to construct
+    AppConfig with the merged dict; returns 400 on validation failure.
+    """
+    try:
+        settings.set_setting(body.key, body.value)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Push fresh stats so the UI reacts; the worker will pick up the change
+    # at the top of its next loop iteration.
+    job.broadcast_progress()
+    return settings.to_dict_view()
+
+
+@app.delete("/api/settings/{key:path}")
+def api_settings_reset_one(key: str):
+    """Drop the override for `key`. The field reverts to YAML/default."""
+    try:
+        settings.reset_setting(key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    job.broadcast_progress()
+    return settings.to_dict_view()
+
+
+@app.post("/api/settings/reset-all")
+def api_settings_reset_all():
+    """Drop all overrides at once."""
+    settings.reset_all()
+    job.broadcast_progress()
+    return settings.to_dict_view()
 
 
 @app.post("/api/reevaluate")

@@ -39,7 +39,10 @@ class ProcessingConfig(BaseModel):
     # How many automatic retries an 'error' file gets before the worker stops
     # picking it up on its own. Manual Re-evaluate always works and resets the
     # counter. 0 = never auto-retry an error file (it must be re-evaluated).
-    max_error_retries: int = 2
+    # Within the error queue, files with the lowest error_count are tried first
+    # (and the oldest last_error_at within that group), so transient flaps don't
+    # exhaust their attempts before the cluster gets re-tried.
+    max_error_retries: int = 5
 
 
 class AppConfig(BaseModel):

@@ -77,10 +77,18 @@ class _State:
 
 
 class JobManager:
-    def __init__(self, cfg: AppConfig, db: Database, data_dir: Path):
+    def __init__(self, cfg: AppConfig, db: Database, data_dir: Path,
+                 settings: Optional["SettingsService"] = None):
         self.cfg = cfg
         self.db = db
         self.data_dir = data_dir
+        # Optional settings service. When set, the worker reloads `self.cfg`
+        # at the top of every _process_loop iteration and rebuilds the LLM
+        # client when LLM-affecting keys changed.
+        self._settings = settings
+        # Tracks the LLM-relevant fingerprint of the current LMClient so we
+        # know when to recreate it.
+        self._llm_fingerprint: tuple = ()
 
         self._lock = threading.RLock()
         self._state = _State()
@@ -448,10 +456,40 @@ class JobManager:
             + (f", {n_groups} duplicate group(s) detected." if n_groups else ".")
         )
 
+    def _refresh_config_from_settings(self) -> bool:
+        """Reload `self.cfg` from the SettingsService (if attached).
+
+        Returns True if any LLM-affecting key changed since last refresh,
+        signaling that the LMClient should be rebuilt.
+        """
+        if self._settings is None:
+            return False
+        try:
+            new_cfg = self._settings.effective_config()
+        except Exception as e:
+            log.warning("Could not refresh effective config: %s", e)
+            return False
+        # Build a fingerprint of LLM-affecting fields.
+        fp = (
+            new_cfg.llm.base_url,
+            new_cfg.llm.api_key,
+            int(new_cfg.llm.request_timeout_seconds),
+        )
+        changed = (fp != self._llm_fingerprint)
+        self.cfg = new_cfg
+        self._llm_fingerprint = fp
+        return changed
+
     def _process_loop(self) -> None:
+        # Pull fresh effective config before constructing the first client.
+        self._refresh_config_from_settings()
         cfg = self.cfg
         client = LMClient(cfg.llm)
         self._llm_client = client
+        # Initial fingerprint matches what we just built.
+        self._llm_fingerprint = (
+            cfg.llm.base_url, cfg.llm.api_key, int(cfg.llm.request_timeout_seconds)
+        )
         try:
             processed_since_xlsx = 0
             while not self._stop_event.is_set():
@@ -461,6 +499,20 @@ class JobManager:
                     if self._stop_event.is_set():
                         break
                     self._set_state("running", "Resumed")
+
+                # Refresh effective config at the top of each loop. If LLM-
+                # affecting settings changed, swap in a fresh client.
+                if self._refresh_config_from_settings():
+                    log.info("LLM-affecting settings changed; rebuilding LM client.")
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    cfg = self.cfg
+                    client = LMClient(cfg.llm)
+                    self._llm_client = client
+                else:
+                    cfg = self.cfg
 
                 rec = self.db.next_pending(
                     max_error_retries=cfg.processing.max_error_retries,
