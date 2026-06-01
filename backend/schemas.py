@@ -55,7 +55,11 @@ class LLMExtraction(BaseModel):
     tags: list[str] = Field(default_factory=list)
     geographic_scope: str = ""
     industry_domain: str = ""
-    quality_score: float = 0.0              # 0..1, model self-rated
+    quality_score: float = 0.0              # 0..1, model self-rated.
+                                             # For map-reduce extractions: this == quality_score_min
+                                             # (kept as the legacy field so existing UI/Excel keeps working).
+    quality_score_min: float = 0.0          # Min across chunks (single-shot: same as quality_score).
+    quality_score_avg: float = 0.0          # Avg across chunks (single-shot: same as quality_score).
     repository: str = ""                    # DEPRECATED in JSON: kept for backwards compat;
                                             # real source of truth is the `repository` column.
     source_url_1: str = ""                  # user-assigned URL references (not extracted by LLM)
@@ -227,6 +231,12 @@ class CurrentFileProgress(BaseModel):
     steps: list[FileStep] = Field(default_factory=list)
     current_step: str = ""
     last_detail: str = ""
+    # Fine-grained sub-progress for the current step. The frontend can
+    # render a sub-progress bar like "Reading slide 14 / 23" or
+    # "Processing chunk 4 / 12" without parsing strings.
+    sub_unit: str = ""                     # e.g. "page", "slide", "sheet", "paragraph", "chunk"
+    sub_current: int = 0                   # 0-based or 1-based; just a counter
+    sub_total: int = 0                     # 0 means "unknown / not applicable"
 
 
 class ProgressSnapshot(BaseModel):

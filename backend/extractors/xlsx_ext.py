@@ -90,7 +90,11 @@ def extract_xlsx(path: Path, progress_cb: ProgressCB = None) -> ExtractionResult
                     line = _row_to_text(row)
                     if line:
                         head_rows.append(line)
-                if i > 100000:  # safety
+                # Safety cap: we only keep the first 30 rows anyway, so
+                # there's no value in scanning further. 5000 rows is plenty
+                # to discover the true row count for the [... omitted ...]
+                # marker.
+                if i > 5000:
                     break
         except Exception as e:
             parts.append(f"[error reading sheet: {e}]")

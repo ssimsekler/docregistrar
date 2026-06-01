@@ -21,6 +21,44 @@ class LLMConfig(BaseModel):
     thinking_on_low_quality: bool = True
     low_quality_threshold: float = 0.6
     max_output_tokens: int = 4096
+    # Total wall-clock time budget (seconds) for ALL LLM activity on a
+    # single file (chunk calls + reduce, including retries). Different
+    # from `request_timeout_seconds` (which is per HTTP request). When
+    # exceeded, the file is marked 'error' with 'llm_total_timeout'.
+    # Default is intentionally generous (~16.7 hours) so this acts as
+    # a safety net rather than an active limit; tighten it from the
+    # Settings dialog if you want a hard cap per file.
+    per_file_timeout_seconds: int = 60000
+
+
+class MapReduceConfig(BaseModel):
+    """Map-reduce LLM strategy for large documents.
+
+    Small docs (<= threshold_chars) go through a single LLM call (the
+    legacy fast path). Larger docs are split into chunks; each chunk is
+    extracted individually (the "map" phase), then results are merged
+    deterministically and an optional final LLM call ("reduce") produces
+    the consolidated narrative fields (title/description/summary/etc.).
+    """
+    enabled: bool = True
+    # Documents with extracted text <= this length go through the
+    # single-shot fast path. Above this they are chunked.
+    threshold_chars: int = 10000
+    # Target size of each chunk (in characters).
+    chunk_chars: int = 10000
+    # Overlap between consecutive chunks to avoid losing context across
+    # boundaries.
+    chunk_overlap_chars: int = 500
+    # Hard ceiling on the number of chunks; if exceeded, chunks are
+    # sampled evenly across the document.
+    max_chunks: int = 200
+    # If True, run a final LLM reduce step to produce the narrative
+    # fields. If False, narrative fields are merged deterministically
+    # (less coherent but faster and zero hallucination risk).
+    reduce_with_llm: bool = True
+    # Smaller output cap for chunk extractions (faster, less likely to
+    # truncate, since each chunk only needs partial fields).
+    per_chunk_max_output_tokens: int = 1500
 
 
 class ExtractConfig(BaseModel):
@@ -28,6 +66,15 @@ class ExtractConfig(BaseModel):
     middle_chars: int = 4000
     tail_chars: int = 4000
     max_file_size_bytes: int = 0
+    # Total time budget (seconds) for extracting text from a single
+    # file. If exceeded, the file is marked 'error' with
+    # 'extraction_timeout' and the worker moves on. 0 = disabled.
+    per_file_timeout_seconds: int = 300
+    # Per-page time budget (seconds) for PDF extraction. Pages that
+    # exceed this are skipped with a marker note. 0 = disabled.
+    per_page_timeout_seconds: int = 20
+    # Map-reduce strategy for large documents. See MapReduceConfig.
+    mapreduce: MapReduceConfig = Field(default_factory=MapReduceConfig)
 
 
 class ServerConfig(BaseModel):

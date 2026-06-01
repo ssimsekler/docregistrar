@@ -46,6 +46,7 @@ EDITABLE_KEYS: set[str] = {
     "llm.thinking_on_low_quality",
     "llm.low_quality_threshold",
     "llm.max_output_tokens",
+    "llm.per_file_timeout_seconds",
     # Processing
     "processing.max_error_retries",
     "excel_write_every_n_files",
@@ -54,6 +55,16 @@ EDITABLE_KEYS: set[str] = {
     "extract.middle_chars",
     "extract.tail_chars",
     "extract.max_file_size_bytes",
+    "extract.per_file_timeout_seconds",
+    "extract.per_page_timeout_seconds",
+    # Map-reduce strategy for large documents
+    "extract.mapreduce.enabled",
+    "extract.mapreduce.threshold_chars",
+    "extract.mapreduce.chunk_chars",
+    "extract.mapreduce.chunk_overlap_chars",
+    "extract.mapreduce.max_chunks",
+    "extract.mapreduce.reduce_with_llm",
+    "extract.mapreduce.per_chunk_max_output_tokens",
     # Scanner
     "include_extensions",
     "ignore_dir_names",

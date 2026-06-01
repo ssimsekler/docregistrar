@@ -589,6 +589,30 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                 </button>
               </div>
               <div className="mini-progress"><div style={{width: `${currentProgress.percent}%`}} /></div>
+              {currentProgress.sub_total > 0 && (
+                <div style={{ marginTop: 4 }}>
+                  <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
+                    {currentProgress.sub_unit
+                      ? `Reading ${currentProgress.sub_unit}: `
+                      : ""}
+                    {currentProgress.sub_current} / {currentProgress.sub_total}
+                    {" ("}
+                    {Math.round(100 * currentProgress.sub_current / Math.max(currentProgress.sub_total, 1))}
+                    {"%)"}
+                  </div>
+                  <div className="mini-progress" style={{ height: 4 }}>
+                    <div style={{
+                      width: `${Math.round(100 * currentProgress.sub_current / Math.max(currentProgress.sub_total, 1))}%`,
+                      background: "var(--accent-2, #4aa3ff)",
+                    }} />
+                  </div>
+                </div>
+              )}
+              {currentProgress.last_detail && (
+                <div className="muted" style={{ fontSize: 11, marginTop: 4, fontStyle: "italic" }}>
+                  {currentProgress.last_detail}
+                </div>
+              )}
               <div className="step-list">
                 {currentProgress.steps.map((s, i) => (
                   <div key={i} className={`step-row ${s.finished_at ? "done" : "active"}`}>
@@ -721,6 +745,13 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               : <PropRow label="Quality score"
                          value={e.quality_score != null ? Number(e.quality_score).toFixed(2) : ""} />
             }
+            {!editing && e.quality_score_min != null && e.quality_score_avg != null
+              && (e.quality_score_min !== e.quality_score_avg) && (
+              <>
+                <PropRow label="Quality (min)" value={Number(e.quality_score_min).toFixed(2)} />
+                <PropRow label="Quality (avg)" value={Number(e.quality_score_avg).toFixed(2)} />
+              </>
+            )}
           </div>
 
           <div className="card">
@@ -837,6 +868,7 @@ const SETTINGS_GROUPS = [
       "llm.thinking_on_low_quality",
       "llm.low_quality_threshold",
       "llm.max_output_tokens",
+      "llm.per_file_timeout_seconds",
     ],
   },
   {
@@ -850,6 +882,20 @@ const SETTINGS_GROUPS = [
       "extract.middle_chars",
       "extract.tail_chars",
       "extract.max_file_size_bytes",
+      "extract.per_file_timeout_seconds",
+      "extract.per_page_timeout_seconds",
+    ],
+  },
+  {
+    name: "Map-reduce (large documents)",
+    keys: [
+      "extract.mapreduce.enabled",
+      "extract.mapreduce.threshold_chars",
+      "extract.mapreduce.chunk_chars",
+      "extract.mapreduce.chunk_overlap_chars",
+      "extract.mapreduce.max_chunks",
+      "extract.mapreduce.reduce_with_llm",
+      "extract.mapreduce.per_chunk_max_output_tokens",
     ],
   },
   {
@@ -883,6 +929,8 @@ const SETTINGS_HELP = {
     "If on, automatically retry with thinking ON when quality_score is below the threshold.",
   "llm.low_quality_threshold": "Quality threshold (0–1) that triggers a thinking-mode rerun.",
   "llm.max_output_tokens": "Max tokens the LLM may produce per call.",
+  "llm.per_file_timeout_seconds":
+    "Total wall-clock time budget (seconds) for ALL LLM activity on a single file (chunk calls + reduce, including retries). When exceeded, the file is marked 'error' with 'llm_total_timeout'. Default 60000 (~16.7h) acts as a safety net; tighten it to e.g. 600 if you want a hard cap per file.",
   "processing.max_error_retries":
     "After this many consecutive failures, the file is no longer auto-retried. Set its status to 'pending' or Re-evaluate to clear the counter.",
   "excel_write_every_n_files":
@@ -1510,7 +1558,21 @@ function App() {
           <span>📈 {pct}%</span>
           {runElapsed && <span>⏱ elapsed: <b>{runElapsed}</b></span>}
           {cfp && cfp.relative_path && (
-            <span>▶ {cfp.relative_path} ({cfp.percent}% / {fmtMs(cfp.elapsed_ms)})</span>
+            <span title={cfp.last_detail || ""}>
+              ▶ {cfp.relative_path} ({cfp.percent}% / {fmtMs(cfp.elapsed_ms)})
+              {cfp.sub_total > 0 && (
+                <>
+                  {" — "}
+                  {cfp.sub_unit ? `${cfp.sub_unit} ` : ""}
+                  {cfp.sub_current}/{cfp.sub_total}
+                </>
+              )}
+            </span>
+          )}
+          {cfp && cfp.last_detail && (
+            <span className="muted" style={{ fontStyle: "italic" }} title={cfp.last_detail}>
+              {cfp.last_detail.length > 80 ? cfp.last_detail.slice(0, 80) + "…" : cfp.last_detail}
+            </span>
           )}
           {!cfp && progress.current_file && <span>▶ {progress.current_file}</span>}
         </div>

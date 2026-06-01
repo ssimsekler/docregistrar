@@ -26,15 +26,55 @@ llm:
   # Output token cap (per LLM call). Must be large enough for reasoning + JSON.
   # 4096 works well with 8192 context length in LM Studio.
   max_output_tokens: 4096
+  # Total wall-clock time budget (seconds) for ALL LLM activity on a single
+  # file (chunk calls + reduce, including retries). Different from
+  # `request_timeout_seconds` (which is per HTTP request). When exceeded, the
+  # file is marked 'error' with 'llm_total_timeout'. Default ~16.7 hours
+  # acts as a safety net rather than an active limit.
+  per_file_timeout_seconds: 60000
 
 # Text-extraction limits sent to the LLM (characters, not tokens).
-# Strategy: head + middle + tail of the document concatenated.
+# For SMALL documents the head + middle + tail of the document is concatenated
+# and sent in a single LLM call. For LARGE documents the map-reduce strategy
+# below kicks in: the FULL extracted text is split into chunks, each chunk is
+# extracted with its own LLM call, and a final reduce LLM call consolidates
+# the narrative fields. This way nothing is dropped on big files.
 extract:
   head_chars: 12000
   middle_chars: 4000
   tail_chars: 4000
   # Skip files larger than this many bytes (0 = no limit).
   max_file_size_bytes: 0
+  # Total time budget (seconds) for extracting text from a single file.
+  # If exceeded, the file is marked 'error' with 'extraction_timeout' and
+  # the worker moves on. 0 = disabled. Default: 300 (5 minutes).
+  per_file_timeout_seconds: 300
+  # Per-page time budget (seconds) for PDF extraction. Pages that exceed
+  # this are skipped with a marker note (rest of the document still
+  # processed). 0 = disabled. Default: 20.
+  per_page_timeout_seconds: 20
+  # Map-reduce strategy for large documents.
+  mapreduce:
+    # Master switch. If false, large docs use head+middle+tail sampling.
+    enabled: true
+    # Documents with extracted text longer than this go through chunked
+    # extraction so every page/section is actually processed by the LLM.
+    threshold_chars: 10000
+    # Target chunk size in characters.
+    chunk_chars: 10000
+    # Overlap between consecutive chunks to avoid losing context across
+    # page boundaries.
+    chunk_overlap_chars: 500
+    # Hard ceiling on chunk count; if exceeded, chunks are sampled
+    # uniformly across the document to keep the LLM call count bounded.
+    max_chunks: 200
+    # Final reduce LLM call to consolidate narrative fields (title,
+    # description, summary, etc.). If false, narrative fields are merged
+    # deterministically (zero hallucination risk, less coherent output).
+    reduce_with_llm: true
+    # Smaller token cap for chunk extractions (faster, less likely to
+    # truncate).
+    per_chunk_max_output_tokens: 1500
 
 # Which extensions to consider documents.
 include_extensions:

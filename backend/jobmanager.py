@@ -10,8 +10,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
+import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +60,12 @@ class _CurrentFile:
     current_step: str = ""
     last_detail: str = ""
     steps: list[dict] = field(default_factory=list)  # list of FileStep dicts
+    # Fine-grained sub-progress for the current step (e.g. page 12/47,
+    # slide 3/23, chunk 4/12). Always kept fresh by the worker; the
+    # broadcast is throttled separately.
+    sub_unit: str = ""
+    sub_current: int = 0
+    sub_total: int = 0
 
 
 @dataclass
@@ -172,6 +181,9 @@ class JobManager:
                     steps=[FileStep(**s) for s in cfp.steps],
                     current_step=cfp.current_step,
                     last_detail=cfp.last_detail,
+                    sub_unit=cfp.sub_unit,
+                    sub_current=cfp.sub_current,
+                    sub_total=cfp.sub_total,
                 )
             return ProgressSnapshot(
                 state=self._state.state,                     # type: ignore[arg-type]
@@ -512,11 +524,23 @@ class JobManager:
         self._llm_fingerprint = fp
         return changed
 
+    def _apply_extractor_env(self) -> None:
+        """Push extractor-related config values to env vars that the
+        per-page extractors read (kept loose-coupled so we don't have to
+        thread cfg through every extractor signature)."""
+        try:
+            os.environ["DOCREGISTRAR_PER_PAGE_TIMEOUT_S"] = str(
+                int(self.cfg.extract.per_page_timeout_seconds)
+            )
+        except Exception:
+            pass
+
     def _process_loop(self) -> None:
         # Pull fresh effective config before constructing the first client.
         self._refresh_config_from_settings()
+        self._apply_extractor_env()
         cfg = self.cfg
-        client = LMClient(cfg.llm)
+        client = LMClient(cfg.llm, cfg.extract.mapreduce)
         self._llm_client = client
         # Initial fingerprint matches what we just built.
         self._llm_fingerprint = (
@@ -541,10 +565,12 @@ class JobManager:
                     except Exception:
                         pass
                     cfg = self.cfg
-                    client = LMClient(cfg.llm)
+                    client = LMClient(cfg.llm, cfg.extract.mapreduce)
                     self._llm_client = client
                 else:
                     cfg = self.cfg
+                # Refresh extractor env vars in case extract config changed.
+                self._apply_extractor_env()
 
                 rec = self.db.next_pending(
                     max_error_retries=cfg.processing.max_error_retries,
@@ -568,7 +594,7 @@ class JobManager:
                         client.close()
                     except Exception:
                         pass
-                    client = LMClient(cfg.llm)
+                    client = LMClient(cfg.llm, cfg.extract.mapreduce)
                     self._llm_client = client
 
                 ok = self._process_one(client, rec)
@@ -685,34 +711,81 @@ class JobManager:
             self._begin_step("extract_text", percent=5,
                              detail=f"Reading {rec.extension} file ({_fmt_size(rec.file_size)})...")
 
-            # Per-page progress callback. Throttle to once every ~250 ms so a
-            # 500-page PDF doesn't flood the WebSocket. Also raise
-            # UserSkippedError if the user asked to skip mid-extraction.
+            # Per-page progress callback. We ALWAYS update the in-memory
+            # sub-progress fields (so /api/progress and the next natural
+            # broadcast see the latest values), but THROTTLE the
+            # WebSocket broadcasts (via _set_detail) to avoid flooding
+            # listeners on a 500-page PDF.
             last_emit = [0.0]
-            EMIT_THROTTLE_S = 0.25
+            EMIT_THROTTLE_S = 0.5
 
             def _on_extract_progress(cur: int, total: int, unit: str) -> None:
                 if self._consume_skip_signal(rec.relative_path):
                     raise UserSkippedError("user skip")
-                now = time.monotonic()
-                if cur != total and (now - last_emit[0]) < EMIT_THROTTLE_S:
-                    return
-                last_emit[0] = now
+                # Always-fresh in-memory state.
                 pct = 5 + int(25 * cur / total) if total else 5
-                if total:
-                    self._set_detail(
-                        f"Reading {unit}: {cur}/{total} ({100 * cur // total}%)"
-                    )
-                else:
-                    self._set_detail(f"Reading {unit}: {cur}")
-                # Bump per-file progress percent within the extract_text band.
                 with self._lock:
                     cfp = self._state.current_file_progress
-                    if cfp is not None and pct > cfp.percent:
-                        cfp.percent = pct
+                    if cfp is not None:
+                        cfp.sub_unit = unit or ""
+                        cfp.sub_current = int(cur)
+                        cfp.sub_total = int(total)
+                        if total:
+                            cfp.last_detail = (
+                                f"Reading {unit}: {cur}/{total} "
+                                f"({100 * cur // total}%)"
+                            )
+                        else:
+                            cfp.last_detail = f"Reading {unit}: {cur}"
+                        if pct > cfp.percent:
+                            cfp.percent = pct
+                # Throttled broadcast.
+                now = time.monotonic()
+                is_boundary = (cur == total) or (cur == 0)
+                if not is_boundary and (now - last_emit[0]) < EMIT_THROTTLE_S:
+                    return
+                last_emit[0] = now
+                self._broadcast_progress()
 
+            # Per-file extraction timeout: run extract_any in a worker
+            # thread and abort if it exceeds the configured budget. This
+            # protects the worker from corrupt files that hang forever.
+            per_file_timeout = float(cfg.extract.per_file_timeout_seconds or 0)
             try:
-                res = extract_any(path, rec.extension, progress_cb=_on_extract_progress)
+                if per_file_timeout > 0:
+                    with ThreadPoolExecutor(max_workers=1) as _ex:
+                        _fut = _ex.submit(
+                            extract_any, path, rec.extension,
+                            progress_cb=_on_extract_progress,
+                        )
+                        try:
+                            res = _fut.result(timeout=per_file_timeout)
+                        except FuturesTimeout:
+                            # Mark as error and bail. The background
+                            # extraction thread will keep running until
+                            # the underlying parser returns; that's
+                            # unfortunate but unavoidable without C-level
+                            # signals (and we're on Windows).
+                            detail = (
+                                f"extraction_timeout: extract_any did not "
+                                f"complete within {int(per_file_timeout)}s "
+                                f"(file_size={_fmt_size(rec.file_size)})"
+                            )
+                            self._end_step("extract_text", percent=10,
+                                           detail=f"FAILED: {detail}")
+                            self.db.mark_status(
+                                rec.relative_path, "error", detail,
+                                repository=rec.repository,
+                                stage="extract_text",
+                            )
+                            self._set_message(
+                                f"Extraction timed out: {rec.relative_path}"
+                            )
+                            self._end_file()
+                            return False
+                else:
+                    res = extract_any(path, rec.extension,
+                                      progress_cb=_on_extract_progress)
             except UserSkippedError:
                 self._end_step("extract_text", percent=10, detail="skipped by user (mid-extraction)")
                 self.db.mark_status(
@@ -756,47 +829,249 @@ class JobManager:
             self._end_step("extract_text", percent=30,
                            detail=f"Extracted {text_len:,} chars{page_info}")
 
-            text = truncate_head_middle_tail(
-                res.text or "",
-                cfg.extract.head_chars,
-                cfg.extract.middle_chars,
-                cfg.extract.tail_chars,
+            # Clear sub-progress between steps (prevents stale "Reading
+            # slide: 23/23" from showing during the LLM step).
+            with self._lock:
+                cfp_clr = self._state.current_file_progress
+                if cfp_clr is not None:
+                    cfp_clr.sub_unit = ""
+                    cfp_clr.sub_current = 0
+                    cfp_clr.sub_total = 0
+
+            # Map-reduce decision: if the extracted text is large enough
+            # to trigger chunked extraction, send the FULL text so every
+            # part of the document is actually processed by the LLM.
+            # Otherwise stick with the head+middle+tail sample for speed.
+            mr_cfg = cfg.extract.mapreduce
+            use_mapreduce_for_this_file = (
+                bool(mr_cfg.enabled)
+                and text_len > int(mr_cfg.threshold_chars)
             )
-            sent_len = len(text)
-            if sent_len < text_len:
-                self._set_detail(f"Truncated to {sent_len:,} chars (head/middle/tail) before sending to LLM")
+            # Compute the actual text we'll send + (for map-reduce) the
+            # chunk count so we can SHOW the strategy decision before the
+            # first LLM call, not after.
+            planned_chunk_count = 0
+            if use_mapreduce_for_this_file:
+                text = res.text or ""
+                # Pure function, no side effects; LMClient will compute the
+                # same split internally when it runs.
+                from .llm import split_text_into_chunks
+                planned_chunk_count = len(split_text_into_chunks(text, mr_cfg))
+                strategy_detail = (
+                    f"map-reduce, {planned_chunk_count} chunk(s) "
+                    f"({text_len:,} chars > {int(mr_cfg.threshold_chars):,} threshold)"
+                )
+            else:
+                text = truncate_head_middle_tail(
+                    res.text or "",
+                    cfg.extract.head_chars,
+                    cfg.extract.middle_chars,
+                    cfg.extract.tail_chars,
+                )
+                sent_len = len(text)
+                if sent_len < text_len:
+                    strategy_detail = (
+                        f"single-shot, {sent_len:,} chars sent "
+                        f"(head+middle+tail of {text_len:,}; "
+                        f"<= {int(mr_cfg.threshold_chars):,} threshold)"
+                    )
+                else:
+                    strategy_detail = (
+                        f"single-shot, {sent_len:,} chars sent "
+                        f"(<= {int(mr_cfg.threshold_chars):,} threshold)"
+                    )
 
             override = self._consume_thinking_override(rec.relative_path)
             effective_thinking = (
                 cfg.llm.thinking_default if override is None else override
             )
             thinking_label = "on" if effective_thinking else "off"
-            self._begin_step("llm_extract", percent=35,
-                             detail=f"Calling LLM (thinking={thinking_label})...")
+            self._begin_step(
+                "llm_extract",
+                percent=35,
+                detail=f"{strategy_detail}, thinking={thinking_label}",
+            )
+
+            # Chunk-progress callback: only meaningful for the map-reduce
+            # path. Updates the same sub_* fields so the UI shows
+            # "Processing chunk 4 / 12" with a sub-progress bar. Also
+            # honors pause/skip between chunks. ALWAYS broadcasts on
+            # boundary (cur=0 or cur=total) so the chunk count appears
+            # immediately even before the first chunk completes.
+            llm_last_emit = [0.0]
+            LLM_EMIT_THROTTLE_S = 0.5
+
+            def _on_llm_progress(unit: str, cur: int, total: int) -> None:
+                if self._consume_skip_signal(rec.relative_path):
+                    raise LLMCancelled("user skip during llm_extract")
+                # Pause between chunks if requested.
+                if not self._pause_event.is_set() and not self._stop_event.is_set():
+                    self._set_state("paused", "Paused (between chunks)")
+                    self._pause_event.wait()
+                    if self._stop_event.is_set():
+                        raise LLMCancelled("stopped during pause")
+                    self._set_state("running", "Resumed")
+                if self._stop_event.is_set():
+                    raise LLMCancelled("stopped between chunks")
+                # Always-fresh in-memory state.
+                with self._lock:
+                    cfp = self._state.current_file_progress
+                    if cfp is not None:
+                        cfp.sub_unit = unit or ""
+                        cfp.sub_current = int(cur)
+                        cfp.sub_total = int(total)
+                        if total and cur:
+                            label = (
+                                "Reducing" if unit == "reduce"
+                                else f"Processing {unit}"
+                            )
+                            cfp.last_detail = (
+                                f"{label}: {cur}/{total} "
+                                f"({100 * cur // max(total, 1)}%)"
+                            )
+                        elif total:
+                            label = (
+                                "Reducing" if unit == "reduce"
+                                else f"Processing {unit}"
+                            )
+                            cfp.last_detail = f"{label}: 0/{total} (starting)"
+                        # Bump per-file percent within the llm_extract
+                        # band (35 -> 90).
+                        if total:
+                            pct = 35 + int(55 * cur / total)
+                            if pct > cfp.percent:
+                                cfp.percent = pct
+                # Boundary updates ALWAYS broadcast immediately. Other
+                # ticks are throttled.
+                now = time.monotonic()
+                is_boundary = (cur == 0) or (cur == total)
+                if not is_boundary and (now - llm_last_emit[0]) < LLM_EMIT_THROTTLE_S:
+                    return
+                llm_last_emit[0] = now
+                self._broadcast_progress()
+
+            # Heartbeat thread: ticks every ~5s while client.extract() is
+            # running. Two purposes:
+            #   1. Visibility: in single-shot mode there's no chunk
+            #      callback, so without this the UI would just show
+            #      "Calling LLM..." for minutes with no movement. The
+            #      heartbeat updates last_detail to "elapsed: Ns" and
+            #      slowly creeps cfp.percent up within the 35..89 band
+            #      (asymptotic, half-life ~60s).
+            #   2. Total-time deadline: if the elapsed time exceeds
+            #      cfg.llm.per_file_timeout_seconds, the heartbeat
+            #      cancels the LLM client (propagates as LLMCancelled /
+            #      LLMTransportError into the extract() call).
+            llm_started = time.monotonic()
+            llm_total_budget_s = float(cfg.llm.per_file_timeout_seconds or 0)
+            llm_deadline = (
+                llm_started + llm_total_budget_s
+                if llm_total_budget_s > 0 else None
+            )
+            heartbeat_stop = threading.Event()
+            heartbeat_state = {
+                "deadline_hit": False,
+                "deadline_at": llm_deadline,
+            }
+            HEARTBEAT_INTERVAL_S = 5.0
+
+            def _heartbeat_run() -> None:
+                # Local copies (closure-captured) of everything we need.
+                started = llm_started
+                deadline = llm_deadline
+                mode = (
+                    "map-reduce"
+                    if use_mapreduce_for_this_file
+                    else "single-shot"
+                )
+                while not heartbeat_stop.is_set():
+                    # Wait up to HEARTBEAT_INTERVAL_S; wakes early on stop.
+                    if heartbeat_stop.wait(timeout=HEARTBEAT_INTERVAL_S):
+                        return
+                    elapsed = time.monotonic() - started
+                    elapsed_s = int(elapsed)
+                    # Deadline check first so we surface the cause clearly.
+                    if deadline is not None and time.monotonic() > deadline:
+                        log.warning(
+                            "LLM total-time budget exceeded for %s "
+                            "(%.0fs > %.0fs); cancelling.",
+                            rec.relative_path,
+                            elapsed,
+                            llm_total_budget_s,
+                        )
+                        heartbeat_state["deadline_hit"] = True
+                        try:
+                            client.cancel()
+                        except Exception:
+                            pass
+                        # Stop ticking; the cancel will propagate as an
+                        # exception out of client.extract().
+                        return
+                    # Asymptotic percent crawl within 35..89 (half-life ~60s).
+                    try:
+                        creep = 1.0 - math.exp(-elapsed / 60.0)
+                    except Exception:
+                        creep = 0.0
+                    pct = min(89, 35 + int(54 * creep))
+                    with self._lock:
+                        cfp = self._state.current_file_progress
+                        if cfp is None:
+                            return
+                        # Only overwrite last_detail when there's no live
+                        # chunk progress (chunk callback updates that
+                        # field too; we don't want to fight with it).
+                        if cfp.sub_total <= 0:
+                            cfp.last_detail = (
+                                f"Calling LLM ({mode})... elapsed: {elapsed_s}s"
+                                + (
+                                    f" (budget: {int(llm_total_budget_s)}s)"
+                                    if llm_total_budget_s > 0 and llm_total_budget_s < 1e9
+                                    else ""
+                                )
+                            )
+                        if pct > cfp.percent:
+                            cfp.percent = pct
+                    self._broadcast_progress()
+
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_run,
+                name=f"docregistrar-llm-heartbeat-{rec.id or rec.relative_path}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
 
             try:
-                extraction, used_thinking = client.extract(
-                    text=text,
-                    file_name=rec.file_name,
-                    relative_path=rec.relative_path,
-                    use_thinking=override,
-                )
-            except LLMCancelled:
-                # The user asked to skip mid-call.
-                self._end_step("llm_extract", percent=50, detail="cancelled (user skip)")
-                self.db.mark_status(
-                    rec.relative_path, "skipped",
-                    "Skipped by user during processing.",
-                    repository=rec.repository,
-                )
-                self._set_message(
-                    f"Skipped (user request) during llm_extract: {rec.relative_path}"
-                )
-                self._end_file()
-                return True
-            except LLMError as e:
-                if self._consume_skip_signal(rec.relative_path):
-                    self._end_step("llm_extract", percent=50, detail="skipped by user (cancelled LLM)")
+                try:
+                    extraction, used_thinking = client.extract(
+                        text=text,
+                        file_name=rec.file_name,
+                        relative_path=rec.relative_path,
+                        use_thinking=override,
+                        progress_cb=_on_llm_progress,
+                    )
+                except LLMCancelled:
+                    if heartbeat_state["deadline_hit"]:
+                        # Total-time budget exceeded: this is an error.
+                        elapsed_s = int(time.monotonic() - llm_started)
+                        detail = (
+                            f"llm_total_timeout: LLM activity exceeded "
+                            f"{int(llm_total_budget_s)}s budget "
+                            f"(elapsed {elapsed_s}s, "
+                            f"strategy: {strategy_detail})"
+                        )
+                        self._fail_step(detail=detail)
+                        self.db.mark_status(
+                            rec.relative_path, "error", detail,
+                            repository=rec.repository, stage="llm_extract",
+                        )
+                        self._set_message(
+                            f"LLM total-time budget exceeded on "
+                            f"{rec.relative_path}: {elapsed_s}s"
+                        )
+                        self._end_file()
+                        return False
+                    # Otherwise the user asked to skip mid-call.
+                    self._end_step("llm_extract", percent=50, detail="cancelled (user skip)")
                     self.db.mark_status(
                         rec.relative_path, "skipped",
                         "Skipped by user during processing.",
@@ -807,7 +1082,47 @@ class JobManager:
                     )
                     self._end_file()
                     return True
-                raise
+                except LLMError as e:
+                    if heartbeat_state["deadline_hit"]:
+                        # Deadline cancellation can also surface as a
+                        # transport error (httpx client closed mid-call).
+                        elapsed_s = int(time.monotonic() - llm_started)
+                        detail = (
+                            f"llm_total_timeout: LLM activity exceeded "
+                            f"{int(llm_total_budget_s)}s budget "
+                            f"(elapsed {elapsed_s}s, "
+                            f"strategy: {strategy_detail}; "
+                            f"underlying: {type(e).__name__}: {e})"
+                        )
+                        self._fail_step(detail=detail)
+                        self.db.mark_status(
+                            rec.relative_path, "error", detail,
+                            repository=rec.repository, stage="llm_extract",
+                        )
+                        self._set_message(
+                            f"LLM total-time budget exceeded on "
+                            f"{rec.relative_path}: {elapsed_s}s"
+                        )
+                        self._end_file()
+                        return False
+                    if self._consume_skip_signal(rec.relative_path):
+                        self._end_step("llm_extract", percent=50, detail="skipped by user (cancelled LLM)")
+                        self.db.mark_status(
+                            rec.relative_path, "skipped",
+                            "Skipped by user during processing.",
+                            repository=rec.repository,
+                        )
+                        self._set_message(
+                            f"Skipped (user request) during llm_extract: {rec.relative_path}"
+                        )
+                        self._end_file()
+                        return True
+                    raise
+            finally:
+                heartbeat_stop.set()
+                # We don't join() here: the thread is daemon and will
+                # exit on its own; joining would just delay our return
+                # by up to HEARTBEAT_INTERVAL_S in the worst case.
 
             if self._consume_skip_signal(rec.relative_path):
                 self._end_step("llm_extract", percent=90, detail="skipped by user after LLM returned")
