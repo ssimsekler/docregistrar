@@ -589,41 +589,82 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                 </button>
               </div>
               <div className="mini-progress"><div style={{width: `${currentProgress.percent}%`}} /></div>
-              {currentProgress.sub_total > 0 && (
-                <div style={{ marginTop: 4 }}>
-                  <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
-                    {(() => {
-                      const u = currentProgress.sub_unit || "";
-                      if (u === "chunk") return "Processing chunk: ";
-                      if (u === "reduce") return "Reducing: ";
-                      return u ? `Reading ${u}: ` : "";
-                    })()}
-                    {currentProgress.sub_current} / {currentProgress.sub_total}
-                    {" ("}
-                    {Math.round(100 * currentProgress.sub_current / Math.max(currentProgress.sub_total, 1))}
-                    {"%)"}
+              {currentProgress.sub_total > 0 && (() => {
+                // The chunk/reduce callback fires AFTER each unit
+                // completes, so sub_current = "completed count". Show
+                // the in-flight unit (completed+1, capped at total) so
+                // the structured block agrees with the heartbeat ticker
+                // ("Processing chunk 1/7" instead of "0/7").
+                const u = currentProgress.sub_unit || "";
+                const total = currentProgress.sub_total;
+                const completed = currentProgress.sub_current;
+                let prefix = "";
+                let display;
+                let pct;
+                if (u === "chunk") {
+                  prefix = "Processing chunk: ";
+                  display = completed < total
+                    ? Math.min(completed + 1, total)
+                    : total;
+                  pct = Math.round(100 * completed / Math.max(total, 1));
+                } else if (u === "reduce") {
+                  prefix = "Reducing: ";
+                  display = completed < total
+                    ? Math.min(completed + 1, total)
+                    : total;
+                  pct = Math.round(100 * completed / Math.max(total, 1));
+                } else {
+                  prefix = u ? `Reading ${u}: ` : "";
+                  display = completed;
+                  pct = Math.round(100 * completed / Math.max(total, 1));
+                }
+                return (
+                  <div style={{ marginTop: 4 }}>
+                    <div className="muted" style={{ fontSize: 11, marginBottom: 2 }}>
+                      {prefix}{display} / {total} ({pct}%)
+                    </div>
+                    <div className="mini-progress" style={{ height: 4 }}>
+                      <div style={{
+                        width: `${pct}%`,
+                        background: "var(--accent-2, #4aa3ff)",
+                      }} />
+                    </div>
                   </div>
-                  <div className="mini-progress" style={{ height: 4 }}>
-                    <div style={{
-                      width: `${Math.round(100 * currentProgress.sub_current / Math.max(currentProgress.sub_total, 1))}%`,
-                      background: "var(--accent-2, #4aa3ff)",
-                    }} />
-                  </div>
-                </div>
-              )}
+                );
+              })()}
               {currentProgress.last_detail && (
                 <div className="muted" style={{ fontSize: 11, marginTop: 4, fontStyle: "italic" }}>
                   {currentProgress.last_detail}
                 </div>
               )}
               <div className="step-list">
-                {currentProgress.steps.map((s, i) => (
-                  <div key={i} className={`step-row ${s.finished_at ? "done" : "active"}`}>
-                    <div className="step-name">{s.name}</div>
-                    <div className="step-time">{s.duration_ms != null ? fmtMs(s.duration_ms) : "..."}</div>
-                    <div className="step-detail muted">{s.detail}</div>
-                  </div>
-                ))}
+                {currentProgress.steps.map((s, i) => {
+                  // Live elapsed for steps that are still running
+                  // (no finished_at yet). The detail panel auto-reloads
+                  // every 1.5s while the file is current, and the
+                  // WebSocket pushes also drive re-renders, so this
+                  // counter ticks visibly.
+                  let timeText;
+                  if (s.duration_ms != null) {
+                    timeText = fmtMs(s.duration_ms);
+                  } else if (s.started_at) {
+                    const startedMs = Date.parse(s.started_at);
+                    if (!Number.isNaN(startedMs)) {
+                      timeText = fmtMs(Date.now() - startedMs);
+                    } else {
+                      timeText = "...";
+                    }
+                  } else {
+                    timeText = "...";
+                  }
+                  return (
+                    <div key={i} className={`step-row ${s.finished_at ? "done" : "active"}`}>
+                      <div className="step-name">{s.name}</div>
+                      <div className="step-time">{timeText}</div>
+                      <div className="step-detail muted">{s.detail}</div>
+                    </div>
+                  );
+                })}
                 {currentProgress.steps.length === 0 && <div className="muted">Starting...</div>}
               </div>
             </div>
@@ -1568,9 +1609,28 @@ function App() {
                   {" — "}
                   {(() => {
                     const u = cfp.sub_unit || "";
-                    if (u === "chunk") return `chunk ${cfp.sub_current}/${cfp.sub_total}`;
-                    if (u === "reduce") return `reducing ${cfp.sub_current}/${cfp.sub_total}`;
-                    return `${u ? u + " " : ""}${cfp.sub_current}/${cfp.sub_total}`;
+                    const total = cfp.sub_total;
+                    const completed = cfp.sub_current;
+                    // For chunk/reduce, the callback fires AFTER each unit
+                    // completes, so cfp.sub_current = "completed count".
+                    // Show the in-flight unit (completed+1, capped at total)
+                    // so the header agrees with the heartbeat ticker.
+                    if (u === "chunk") {
+                      const inFlight = Math.min(completed + 1, total);
+                      return completed < total
+                        ? `chunk ${inFlight}/${total}`
+                        : `chunk ${total}/${total}`;
+                    }
+                    if (u === "reduce") {
+                      const inFlight = Math.min(completed + 1, total);
+                      return completed < total
+                        ? `reducing ${inFlight}/${total}`
+                        : `reducing ${total}/${total}`;
+                    }
+                    // page / slide / sheet / paragraph: callback fires AFTER
+                    // each unit; "Reading slide 14/47" reads naturally as
+                    // "currently on 14 of 47", so leave as-is.
+                    return `${u ? u + " " : ""}${completed}/${total}`;
                   })()}
                 </>
               )}
