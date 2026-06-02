@@ -177,6 +177,10 @@ docregistrar/
 - **`registry.xlsx` not updating** — close it in Excel.exe (the agent will pick it up on the next checkpoint).
 - **Re-running on same folder** — files with identical SHA-256 are skipped automatically. Use the UI's **Re-evaluate** button to force selected files.
 - **Process stuck "scanning"** — the very first scan computes SHA-256 of every file; for 35 GB this can take several minutes.
+- **The worker appears to freeze for several minutes on a laptop** — most modern laptops use **Modern Standby (S0)** instead of classic S3 sleep, and Windows can suspend background processes when the user is idle. The agent already requests `ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED` (covers both classic and Modern Standby), and on resume it emits a `[hb] system was suspended for ~Xm Ys (resumed at HH:MM:SS)` line in the activity log so you can tell at a glance whether the worker really froze or the OS just paused it.
+  - To check whether your machine uses Modern Standby, run `powercfg /a` in PowerShell. If the output mentions "Standby (S0 Low Power Idle)" you're on Modern Standby.
+  - If the worker keeps getting suspended despite our hint, Group Policy or your power plan is overriding it. Workarounds: keep the laptop **plugged in with the lid open**; set **Settings → System → Power → Sleep → "Plugged in"** to **Never**; or run the agent on a desktop / always-on machine.
+  - The startup log line `[startup] keep-awake acquired ...; power model: Modern Standby (S0)` confirms which model your OS reports.
 
 ---
 

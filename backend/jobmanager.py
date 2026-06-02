@@ -406,6 +406,20 @@ class JobManager:
                         "sleep suppressor could not be acquired; the laptop "
                         "may still sleep mid-extraction."
                     )
+                # Surface the keep-awake outcome as a [user]-style line so
+                # it shows up in the persistent activity log AND the WS
+                # broadcast. Useful when the user wonders why the worker
+                # appears to freeze for minutes at a time on a laptop
+                # (Modern Standby suspends background processes despite
+                # the classic ES_SYSTEM_REQUIRED hint).
+                status = self._keep_awake.last_status
+                if status:
+                    self._set_message(f"[startup] {status}")
+            else:
+                self._set_message(
+                    "[startup] keep_awake_while_running=false; system may "
+                    "sleep mid-extraction (heartbeat will detect resumption)"
+                )
         except Exception:
             log.exception("Keep-awake acquire failed; continuing without it.")
 
@@ -1163,12 +1177,50 @@ class JobManager:
                     else "single-shot"
                 )
                 last_log_emit_mono = started  # never emit before the first interval elapses
+                # Wall-clock sibling of `last_log_emit_mono`. Used to detect
+                # OS suspension: when the laptop sleeps, time.monotonic()
+                # is paused but datetime.now() keeps advancing. A wall-
+                # clock delta significantly larger than the monotonic delta
+                # over a single tick means the process was suspended for
+                # ~delta-monotonic seconds.
+                last_tick_wall = datetime.now()
+                last_tick_mono = started
+                # Threshold above which we treat a missing tick as a real
+                # suspension (vs minor scheduler jitter).
+                SUSPENSION_THRESHOLD_S = 30.0
                 while not heartbeat_stop.is_set():
                     # Wait up to HEARTBEAT_INTERVAL_S; wakes early on stop.
                     if heartbeat_stop.wait(timeout=HEARTBEAT_INTERVAL_S):
                         return
                     now_mono = time.monotonic()
                     elapsed = now_mono - started
+
+                    # OS-suspension detection. Compare wall-clock and
+                    # monotonic deltas since the previous tick. If the
+                    # wall-clock delta is materially larger than the
+                    # monotonic delta, the process was suspended (Modern
+                    # Standby, lid close, etc.). Emit a single log line
+                    # so the user can tell "it stalled because I closed
+                    # the laptop", not "the LLM got stuck".
+                    now_wall = datetime.now()
+                    try:
+                        wall_delta = (now_wall - last_tick_wall).total_seconds()
+                    except Exception:
+                        wall_delta = HEARTBEAT_INTERVAL_S
+                    mono_delta = now_mono - last_tick_mono
+                    suspended_s = wall_delta - mono_delta
+                    if suspended_s >= SUSPENSION_THRESHOLD_S:
+                        try:
+                            self._set_message(
+                                f"  [hb] system was suspended for "
+                                f"~{_fmt_secs(suspended_s)} "
+                                f"(resumed at {now_wall.strftime('%H:%M:%S')}); "
+                                f"LLM call still in flight"
+                            )
+                        except Exception:
+                            log.exception("suspension log emission failed")
+                    last_tick_wall = now_wall
+                    last_tick_mono = now_mono
                     # Deadline check first so we surface the cause clearly.
                     if deadline is not None and now_mono > deadline:
                         log.warning(
