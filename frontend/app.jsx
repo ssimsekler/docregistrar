@@ -962,6 +962,7 @@ const SETTINGS_GROUPS = [
     keys: [
       "processing.max_error_retries",
       "processing.keep_awake_while_running",
+      "processing.heartbeat_log_interval_seconds",
       "excel_write_every_n_files",
     ],
   },
@@ -1025,6 +1026,8 @@ const SETTINGS_HELP = {
     "After this many consecutive failures, the file is no longer auto-retried. Set its status to 'pending' or Re-evaluate to clear the counter.",
   "processing.keep_awake_while_running":
     "Prevent the OS from sleeping while the worker is running. On Windows this calls SetThreadExecutionState so system sleep is suppressed; the display can still turn off. Auto-released when the worker idles or stops. No-op on non-Windows. Recommended ON: a sleeping laptop typically kills the in-flight file with llm_transport_error / extraction_timeout when it wakes.",
+  "processing.heartbeat_log_interval_seconds":
+    "How often the worker logs an `[hb]` heartbeat line during long LLM calls (visible in the Activity log at \"verbose\" verbosity). The UI progress ticker still updates every 5s regardless of this value; this only controls how often a heartbeat shows up in the persistent log. Use 0 to disable. Default 120 (= every 2 minutes).",
   "excel_write_every_n_files":
     "Refresh the on-disk registry.xlsx after this many files complete (and at end of run).",
   "extract.head_chars": "Characters from the start of the document sent to the LLM.",
@@ -1194,40 +1197,34 @@ function SettingsDialog({ open, onClose }) {
                     const restart = isRestartRequired(key);
                     const dirty = key in drafts;
                     return (
-                      <div className="prop-row" key={key} style={{ alignItems: "flex-start" }}>
-                        <div className="prop-label" style={{ minWidth: 220 }}>
-                          <div style={{ fontFamily: "ui-monospace,Menlo,Consolas,monospace", fontSize: 12 }}>
-                            {key}
-                            {overridden && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(modified)</span>}
-                            {restart && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(restart required)</span>}
-                          </div>
-                          {SETTINGS_HELP[key] && (
-                            <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{SETTINGS_HELP[key]}</div>
-                          )}
+                      <div className="setting-row" key={key}>
+                        <div className="setting-key">
+                          {key}
+                          {overridden && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(modified)</span>}
+                          {restart && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(restart required)</span>}
+                          {dirty && <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>· unsaved</span>}
                         </div>
-                        <div className="prop-value" style={{ flex: 1 }}>
+                        <div className="setting-input">
                           {renderInput(key)}
-                          <div style={{ display: "flex", gap: 6, marginTop: 4, alignItems: "center" }}>
-                            {!restart && (
-                              <button className="primary"
-                                      disabled={!dirty || savingKey === key}
-                                      onClick={() => saveSetting(key)}
-                                      title="Save this setting">
-                                💾 Save
-                              </button>
-                            )}
-                            {overridden && !restart && (
-                              <button onClick={() => resetSetting(key)}
-                                      disabled={savingKey === key}
-                                      title={`Reset to default (${JSON.stringify(defaultVal(key))})`}>
-                                🔄 Reset
-                              </button>
-                            )}
-                            {dirty && (
-                              <span className="muted" style={{ fontSize: 11 }}>unsaved</span>
-                            )}
-                          </div>
                         </div>
+                        {!restart && (
+                          <button className="primary"
+                                  disabled={!dirty || savingKey === key}
+                                  onClick={() => saveSetting(key)}
+                                  title="Save this setting">
+                            💾 Save
+                          </button>
+                        )}
+                        {overridden && !restart && (
+                          <button onClick={() => resetSetting(key)}
+                                  disabled={savingKey === key}
+                                  title={`Reset to default (${JSON.stringify(defaultVal(key))})`}>
+                            🔄 Reset
+                          </button>
+                        )}
+                        {SETTINGS_HELP[key] && (
+                          <div className="setting-help">{SETTINGS_HELP[key]}</div>
+                        )}
                       </div>
                     );
                   })}
@@ -1286,9 +1283,85 @@ function App() {
     return 460;
   });
   const [dragging, setDragging] = useState(false);
+  // Date input for the "Clear logs older than ..." toolbar; initialised
+  // to today − 7 days in local time so a single click trims a week's worth.
+  const [clearLogDate, setClearLogDate] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 7);
+    return d.toISOString().slice(0, 10);  // YYYY-MM-DD
+  });
   const wsRef = useRef(null);
   const verbosityRef = useRef(verbosity);
   useEffect(() => { verbosityRef.current = verbosity; }, [verbosity]);
+
+  // Replay persisted activity-log events on mount so reloads / fresh
+  // tabs show recent history (worker steps + [user] actions). Best
+  // effort — silent failure leaves logLines empty until the WS sends
+  // its first push.
+  useEffect(() => {
+    let aborted = false;
+    api("GET", "/api/events?limit=1000")
+      .then(r => {
+        if (aborted) return;
+        const items = Array.isArray(r.items) ? r.items : [];
+        // The API returns newest-first; flip to chronological order so
+        // the panel reads top-to-bottom like the live stream does.
+        const lines = items
+          .slice()
+          .reverse()
+          .map(it => {
+            // Convert UTC ISO to a local time string for display.
+            let ts = "";
+            try {
+              const d = new Date(it.ts);
+              ts = Number.isNaN(d.getTime()) ? (it.ts || "") : d.toLocaleTimeString();
+            } catch { ts = it.ts || ""; }
+            return { ts, text: it.message || "" };
+          });
+        // Prepend (the WS may have already pushed a few new lines on top
+        // of these). Cap at 1000 to match the live cap.
+        setLogLines(prev => [...lines, ...prev].slice(-1000));
+      })
+      .catch(() => { /* persisted log unavailable; ignore */ });
+    return () => { aborted = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Clear-older-than handler used by the activity log toolbar.
+  const onClearOlderLogs = async () => {
+    const date = (clearLogDate || "").trim();
+    if (!date) {
+      alert("Pick a date first.");
+      return;
+    }
+    if (!confirmAction(
+      `Permanently delete all activity-log entries older than ${date}?\n\n` +
+      `This affects only the persistent event_log; any lines already shown ` +
+      `in this panel stay visible until the next reload.`
+    )) return;
+    try {
+      const r = await api("POST", "/api/events/clear", { before: date });
+      alert(`Deleted ${r.deleted || 0} log entr${(r.deleted || 0) === 1 ? "y" : "ies"} older than ${date}.`);
+      // Refresh the panel from the persistent log so the user sees a
+      // truthful state (the in-memory tail is now stale w.r.t. older
+      // lines). Newest-first → reverse → chronological.
+      try {
+        const r2 = await api("GET", "/api/events?limit=1000");
+        const items = Array.isArray(r2.items) ? r2.items : [];
+        const lines = items.slice().reverse().map(it => {
+          let ts = "";
+          try {
+            const d = new Date(it.ts);
+            ts = Number.isNaN(d.getTime()) ? (it.ts || "") : d.toLocaleTimeString();
+          } catch { ts = it.ts || ""; }
+          return { ts, text: it.message || "" };
+        });
+        setLogLines(lines.slice(-1000));
+      } catch { /* leave existing lines */ }
+    } catch (e) {
+      alert(`Could not clear logs:\n${e.message}`);
+    }
+  };
 
   // The selected repository as an object (or null), pulled from the cache.
   const selectedRepoObj = useMemo(
@@ -2060,6 +2133,24 @@ function App() {
           ) : (
             <div className="right-panel">
               <h2>Activity log</h2>
+              <div className="log-toolbar"
+                   title="Permanently delete persisted log entries older than the chosen date.">
+                <span className="muted">🗑 Clear logs older than</span>
+                <input
+                  type="date"
+                  value={clearLogDate}
+                  onChange={e => setClearLogDate(e.target.value)}
+                  title="Cutoff date (local time). Entries with a timestamp before this day's midnight are deleted."
+                />
+                <button onClick={onClearOlderLogs}
+                        title="Permanently delete persisted log entries older than the chosen date">
+                  Clear
+                </button>
+                <span className="spacer"></span>
+                <span className="muted" style={{ fontSize: 11 }}>
+                  {logLines.length} line{logLines.length === 1 ? "" : "s"} shown
+                </span>
+              </div>
               <div className="log">
                 {logLines.map((l, i) => (
                   <div className="line" key={i}>

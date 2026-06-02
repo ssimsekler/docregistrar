@@ -214,6 +214,30 @@ class DeleteFilesRequest(BaseModel):
     relative_paths: list[str]
 
 
+# -------- Event log --------
+
+class EventLogEntry(BaseModel):
+    """One persisted log line.
+
+    `category` separates user-driven events (`user`) from worker-driven
+    events (`worker`). `level` is informational; we record everything as
+    'info' today but the column is there so we can graduate noisy errors
+    later without a migration.
+    """
+    id: int
+    ts: str                                 # ISO datetime UTC
+    level: str = "info"
+    category: str                           # 'user' | 'worker' | 'system'
+    message: str
+
+
+class EventLogClearRequest(BaseModel):
+    """`before` is a YYYY-MM-DD date string interpreted in the server's
+    local time. Everything strictly older than the start of that day is
+    purged. The default supplied by the UI is today − 7 days."""
+    before: str
+
+
 class FileStep(BaseModel):
     name: str                              # "extract_text" | "llm_extract" | "save"
     started_at: str

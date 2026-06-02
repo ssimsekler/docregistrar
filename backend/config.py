@@ -99,6 +99,13 @@ class ProcessingConfig(BaseModel):
     # llm_transport_error / extraction_timeout when it wakes (the OS pauses
     # the process while time.monotonic continues).
     keep_awake_while_running: bool = True
+    # How often the worker logs an `[hb]` heartbeat line during long LLM
+    # calls (visible in the Activity log at "verbose" verbosity). The
+    # cfp.last_detail UI ticker still updates every 5s regardless of this
+    # value; this only controls how often a heartbeat shows up in the
+    # persistent log. 0 disables heartbeat log lines (the UI ticker still
+    # ticks). Default 120 (= every 2 minutes).
+    heartbeat_log_interval_seconds: int = 120
 
 
 class AppConfig(BaseModel):

@@ -15,7 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -410,6 +410,22 @@ class JobManager:
             log.exception("Keep-awake acquire failed; continuing without it.")
 
         try:
+            # One-shot rolling cleanup: drop event_log entries older than
+            # 30 days at the start of every run. This is a safety net so
+            # the table can't grow without bound; the user-driven "clear
+            # logs older than X" purge (POST /api/events/clear) is the
+            # primary mechanism.
+            try:
+                cutoff_dt = datetime.now(tz=timezone.utc) - timedelta(days=30)
+                cutoff_iso = cutoff_dt.isoformat(timespec="seconds")
+                purged = self.db.delete_events_before(cutoff_iso)
+                if purged > 0:
+                    self._set_message(
+                        f"[event_log] purged {purged} entries older than 30 days"
+                    )
+            except Exception:
+                log.exception("event_log 30-day rolling purge failed")
+
             with self._lock:
                 skip_scan = self._state.skip_scan
                 self._state.skip_scan = False  # one-shot
@@ -961,6 +977,11 @@ class JobManager:
                 #   cb("reduce", 0, 1)      -> reduce step starting now
                 #   cb("reduce", 1, 1)      -> reduce finished
                 now_mono = time.monotonic()
+                # Compute per-chunk elapsed BEFORE we mutate chunk_state,
+                # so the "chunk i done in Ms" log line below reports the
+                # actual time the chunk took, not 0ms.
+                prev_chunk_started_at = chunk_state.get("chunk_started_at")
+                prev_reduce_started_at = chunk_state.get("reduce_started_at")
                 if unit == "chunk":
                     if cur == 0:
                         # First call, before any chunk runs.
@@ -976,6 +997,57 @@ class JobManager:
                         chunk_state["reduce_started_at"] = now_mono
                     else:
                         chunk_state["reduce_started_at"] = None
+
+                # Verbose-only log lines for each chunk / reduce boundary.
+                # These start with two spaces + "[" so the frontend filter
+                # keeps them at "verbose" verbosity only.
+                try:
+                    if unit == "chunk":
+                        if cur == 0 and total > 0:
+                            self._set_message(
+                                f"  [llm_extract] starting chunk 1/{total}"
+                            )
+                        elif 0 < cur < total:
+                            ms = (
+                                int((now_mono - prev_chunk_started_at) * 1000)
+                                if prev_chunk_started_at is not None else None
+                            )
+                            ms_part = f" in {ms} ms" if ms is not None else ""
+                            self._set_message(
+                                f"  [llm_extract] chunk {cur}/{total} done{ms_part} "
+                                f"(next: chunk {cur + 1})"
+                            )
+                        elif cur == total and total > 0:
+                            ms = (
+                                int((now_mono - prev_chunk_started_at) * 1000)
+                                if prev_chunk_started_at is not None else None
+                            )
+                            ms_part = f" in {ms} ms" if ms is not None else ""
+                            self._set_message(
+                                f"  [llm_extract] chunk {cur}/{total} done{ms_part}"
+                            )
+                            self._set_message(
+                                f"  [llm_extract] all {total} chunks done; "
+                                f"entering reduce phase"
+                            )
+                    elif unit == "reduce":
+                        if cur == 0:
+                            self._set_message(
+                                f"  [llm_extract] reduce starting "
+                                f"(consolidating {planned_chunk_count} chunks)"
+                            )
+                        elif cur == total:
+                            ms = (
+                                int((now_mono - prev_reduce_started_at) * 1000)
+                                if prev_reduce_started_at is not None else None
+                            )
+                            ms_part = f" in {ms} ms" if ms is not None else ""
+                            self._set_message(
+                                f"  [llm_extract] reduce done{ms_part}"
+                            )
+                except Exception:
+                    # Never let progress-log emission take down the worker.
+                    log.exception("llm_extract progress log emission failed")
 
                 # Always-fresh in-memory state.
                 with self._lock:
@@ -1055,6 +1127,22 @@ class JobManager:
                 "deadline_at": llm_deadline,
             }
             HEARTBEAT_INTERVAL_S = 5.0
+            # Separate cadence for the verbose "[hb]" log line. The 5s
+            # interval above drives the cfp.last_detail UI ticker; this
+            # one drives a persistent log line that survives reloads.
+            # Read the interval ONCE; settings changes mid-file take
+            # effect on the next file.
+            try:
+                hb_log_interval_s = float(
+                    cfg.processing.heartbeat_log_interval_seconds or 0
+                )
+                if 0 < hb_log_interval_s < 5:
+                    # Below 5s would compete with the UI ticker without
+                    # adding signal; clamp to the floor mentioned in the
+                    # setting help.
+                    hb_log_interval_s = 5.0
+            except Exception:
+                hb_log_interval_s = 120.0
 
             def _fmt_secs(s: float) -> str:
                 s = max(0, int(s))
@@ -1074,6 +1162,7 @@ class JobManager:
                     if use_mapreduce_for_this_file
                     else "single-shot"
                 )
+                last_log_emit_mono = started  # never emit before the first interval elapses
                 while not heartbeat_stop.is_set():
                     # Wait up to HEARTBEAT_INTERVAL_S; wakes early on stop.
                     if heartbeat_stop.wait(timeout=HEARTBEAT_INTERVAL_S):
@@ -1144,7 +1233,55 @@ class JobManager:
                                 f"Calling LLM ({mode})... elapsed: "
                                 f"{_fmt_secs(elapsed)}{budget_suffix}"
                             )
+                        # Capture values for the throttled [hb] log line
+                        # (computed below, OUTSIDE the lock).
+                        hb_sub_unit = sub_unit
+                        hb_sub_total = sub_total
+                        hb_in_flight = (
+                            min(sub_current + 1, sub_total)
+                            if sub_total > 0 else 0
+                        )
+                        hb_chunk_elapsed_ms = (
+                            int((now_mono - chunk_started_at) * 1000)
+                            if chunk_started_at is not None else None
+                        )
+                        hb_reduce_elapsed_ms = (
+                            int((now_mono - reduce_started_at) * 1000)
+                            if reduce_started_at is not None else None
+                        )
                     self._broadcast_progress()
+
+                    # Throttled persistent "[hb]" log line. Disabled when
+                    # interval == 0. Starts with two spaces + "[" so the
+                    # frontend filter keeps it at "verbose" verbosity.
+                    if hb_log_interval_s > 0 and \
+                            (now_mono - last_log_emit_mono) >= hb_log_interval_s:
+                        last_log_emit_mono = now_mono
+                        try:
+                            total_ms = int(elapsed * 1000)
+                            if hb_sub_unit == "chunk" and hb_sub_total > 0 \
+                                    and hb_chunk_elapsed_ms is not None:
+                                hb_msg = (
+                                    f"  [hb] LLM alive — chunk "
+                                    f"{hb_in_flight}/{hb_sub_total} "
+                                    f"(chunk {hb_chunk_elapsed_ms} ms / "
+                                    f"total {total_ms} ms)"
+                                )
+                            elif hb_sub_unit == "reduce" \
+                                    and hb_reduce_elapsed_ms is not None:
+                                hb_msg = (
+                                    f"  [hb] LLM alive — reduce "
+                                    f"({hb_reduce_elapsed_ms} ms / "
+                                    f"total {total_ms} ms)"
+                                )
+                            else:
+                                hb_msg = (
+                                    f"  [hb] LLM alive — {mode} "
+                                    f"(total {total_ms} ms)"
+                                )
+                            self._set_message(hb_msg)
+                        except Exception:
+                            log.exception("heartbeat log emission failed")
 
             heartbeat_thread = threading.Thread(
                 target=_heartbeat_run,
@@ -1489,6 +1626,16 @@ class JobManager:
         with self._lock:
             self._state.last_message = message
         log.info("MSG %s", message)
+        # Persist to event_log (best-effort; never raises). Anything that
+        # comes through _set_message — worker step lines, [user] action
+        # logs from main.py, heartbeats — gets captured here.
+        try:
+            category = "user" if (message or "").startswith("[user] ") else "worker"
+            self.db.append_event("info", category, message)
+        except Exception:
+            # _set_message must never take down the worker. The DB layer
+            # already swallows + logs, so this is just defense-in-depth.
+            pass
         self._broadcast_progress()
 
     def _broadcast_progress(self) -> None:

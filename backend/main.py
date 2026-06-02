@@ -22,6 +22,7 @@ from .jobmanager import JobManager
 from .schemas import (
     BulkEditRequest,
     DeleteFilesRequest,
+    EventLogClearRequest,
     FileEditRequest,
     ReevaluateRequest,
     RepositoryCreateRequest,
@@ -81,6 +82,28 @@ async def _on_shutdown() -> None:
     log.info("Shutdown complete.")
 
 
+def _log_user(message: str) -> None:
+    """Emit a user-action audit line.
+
+    Routed through `JobManager._set_message` so it lands in the activity
+    log AND in the persistent `event_log` table (best-effort). The
+    `[user] ` prefix has ONE leading space (not two), so the frontend
+    verbosity filter — which hides lines starting with two spaces at
+    quiet/normal level — still surfaces these everywhere.
+    """
+    try:
+        if not message:
+            return
+        # Direct call into the worker's _set_message: it does the DB
+        # append and the WS broadcast for us. Using the leading "[user] "
+        # makes the line easy to grep AND keeps it visible at all
+        # verbosities.
+        job._set_message(f"[user] {message}")  # noqa: SLF001
+    except Exception:
+        # Audit logging must never raise into a request handler.
+        log.exception("_log_user failed")
+
+
 # -------- API --------
 
 @app.get("/api/config")
@@ -137,24 +160,29 @@ def api_progress(repository: str | None = None):
 def api_start(req: StartRequest):
     if not (req.repository or "").strip():
         raise HTTPException(400, "repository is required")
-    job.start(req.repository.strip())
+    repo = req.repository.strip()
+    _log_user(f"start repository={repo!r}")
+    job.start(repo)
     return job.snapshot().model_dump()
 
 
 @app.post("/api/pause")
 def api_pause():
+    _log_user("pause")
     job.pause()
     return job.snapshot().model_dump()
 
 
 @app.post("/api/resume")
 def api_resume():
+    _log_user("resume")
     job.resume()
     return job.snapshot().model_dump()
 
 
 @app.post("/api/stop")
 def api_stop():
+    _log_user("stop")
     job.stop()
     return job.snapshot().model_dump()
 
@@ -182,6 +210,9 @@ def api_create_repository(body: RepositoryCreateRequest):
         rec = db.create_repository(body.name, body.path, body.description or "")
     except ValueError as e:
         raise HTTPException(400, str(e))
+    _log_user(
+        f"repository create name={rec.name!r} path={rec.path!r}"
+    )
     job.broadcast_progress()
     return rec.model_dump()
 
@@ -196,6 +227,15 @@ def api_update_repository(name: str, body: RepositoryUpdateRequest):
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+    fields_changed = []
+    if body.path is not None:
+        fields_changed.append(f"path={body.path!r}")
+    if body.description is not None:
+        fields_changed.append("description=<updated>")
+    _log_user(
+        f"repository update name={name!r} "
+        + (", ".join(fields_changed) if fields_changed else "(no fields)")
+    )
     job.broadcast_progress()
     return rec.model_dump()
 
@@ -206,6 +246,7 @@ def api_rename_repository(name: str, body: RepositoryRenameRequest):
         rec = db.rename_repository(name, body.new_name)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    _log_user(f"repository rename {name!r} -> {body.new_name!r}")
     job.broadcast_progress()
     return rec.model_dump()
 
@@ -219,6 +260,9 @@ def api_delete_repository(name: str):
         n = db.delete_repository(name, clear_files=True)
     except ValueError as e:
         raise HTTPException(404, str(e))
+    _log_user(
+        f"repository delete name={name!r} files_cleared={n}"
+    )
     job.broadcast_progress()
     return {"deleted": True, "files_cleared": n}
 
@@ -246,6 +290,18 @@ def api_settings_set(body: SettingsUpdateRequest):
         settings.set_setting(body.key, body.value)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # Render the value compactly for the audit line. Long lists get
+    # summarised so we don't dump 50 entries into the log.
+    try:
+        if isinstance(body.value, list):
+            value_str = f"[{len(body.value)} item(s)]"
+        else:
+            value_str = repr(body.value)
+            if len(value_str) > 80:
+                value_str = value_str[:77] + "..."
+    except Exception:
+        value_str = "<unprintable>"
+    _log_user(f"settings set {body.key}={value_str}")
     # Push fresh stats so the UI reacts; the worker will pick up the change
     # at the top of its next loop iteration.
     job.broadcast_progress()
@@ -259,6 +315,7 @@ def api_settings_reset_one(key: str):
         settings.reset_setting(key)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    _log_user(f"settings reset {key}")
     job.broadcast_progress()
     return settings.to_dict_view()
 
@@ -267,6 +324,7 @@ def api_settings_reset_one(key: str):
 def api_settings_reset_all():
     """Drop all overrides at once."""
     settings.reset_all()
+    _log_user("settings reset-all")
     job.broadcast_progress()
     return settings.to_dict_view()
 
@@ -275,6 +333,10 @@ def api_settings_reset_all():
 def api_reevaluate(req: ReevaluateRequest):
     if not req.relative_paths:
         raise HTTPException(400, "relative_paths is required")
+    _log_user(
+        f"reevaluate n={len(req.relative_paths)} "
+        f"thinking={req.use_thinking} force={req.force}"
+    )
     n_reset, n_skipped, n_skipped_status = job.reevaluate(
         req.relative_paths,
         use_thinking=req.use_thinking,
@@ -303,6 +365,9 @@ def api_file_edit(relative_path: str, body: FileEditRequest):
         job._wakeup.set()  # noqa: SLF001
     if fields.get("status") == "skipped":
         job.signal_skip(relative_path)
+    _log_user(
+        f"file edit path={relative_path!r} fields=[{', '.join(sorted(fields.keys()))}]"
+    )
     job.broadcast_progress()
     rec = db.get_file(relative_path)
     return _decorate_file_response(rec)
@@ -324,6 +389,12 @@ def api_files_bulk_edit(body: BulkEditRequest):
     if body.status == "skipped":
         for p in body.relative_paths:
             job.signal_skip(p)
+    parts = [f"n={len(body.relative_paths)}"]
+    if body.repository is not None:
+        parts.append(f"repository={body.repository!r}")
+    if body.status is not None:
+        parts.append(f"status={body.status!r}")
+    _log_user(f"files bulk-edit {' '.join(parts)} updated={n}")
     job.broadcast_progress()
     return {"updated": n}
 
@@ -423,6 +494,9 @@ def api_skip_dup_siblings(body: SkipDupSiblingsRequest):
     if not body.relative_paths:
         raise HTTPException(400, "relative_paths is required")
     n = db.skip_dup_siblings_of(body.relative_paths)
+    _log_user(
+        f"files skip-dup-siblings n={len(body.relative_paths)} updated={n}"
+    )
     job.broadcast_progress()
     return {"updated": n}
 
@@ -436,6 +510,7 @@ def api_file_skip_current(req: OpenFileRequest):
     rel = (req.relative_path or "").strip()
     if not rel:
         raise HTTPException(400, "relative_path is required")
+    _log_user(f"file skip-current path={rel!r}")
     job.signal_skip(rel)
     job.broadcast_progress()
     return {"ok": True, "skipping": rel}
@@ -450,8 +525,54 @@ def api_files_delete(body: DeleteFilesRequest):
         if p:
             job.signal_skip(p)
     n = db.delete_files(body.relative_paths)
+    _log_user(
+        f"files delete n={len(body.relative_paths)} deleted={n}"
+    )
     job.broadcast_progress()
     return {"deleted": n}
+
+
+# -------- Event log (persistent activity log) --------
+
+@app.get("/api/events")
+def api_events_list(limit: int = 1000, since: str | None = None):
+    """Return recent event_log rows, newest-first.
+
+    `limit` is capped at 10000 by the DB layer. `since` filters to rows
+    with `ts > since` (ISO datetime string).
+    """
+    items = db.list_events(
+        limit=max(1, min(10000, int(limit or 1000))),
+        since_iso=since if since else None,
+    )
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/events/clear")
+def api_events_clear(body: EventLogClearRequest):
+    """Delete all events strictly older than the START of the local-day
+    given by `before` (YYYY-MM-DD). Returns the deleted row count.
+    """
+    raw = (body.before or "").strip()
+    if not raw:
+        raise HTTPException(400, "before (YYYY-MM-DD) is required")
+    try:
+        # Parse as a local-naive date. Anything before its midnight in
+        # *local* time is considered older. We compare against the UTC
+        # ISO string we store in event_log, so we convert local-midnight
+        # to UTC first.
+        local_midnight = datetime.strptime(raw, "%Y-%m-%d")
+        # astimezone(None) treats naive datetimes as local time and
+        # produces an aware UTC datetime via .astimezone(timezone.utc).
+        from datetime import timezone as _tz
+        local_midnight_aware = local_midnight.astimezone()  # adds local tz
+        cutoff_utc = local_midnight_aware.astimezone(_tz.utc)
+        cutoff_iso = cutoff_utc.isoformat(timespec="seconds")
+    except ValueError:
+        raise HTTPException(400, f"invalid date {raw!r}; expected YYYY-MM-DD")
+    n = db.delete_events_before(cutoff_iso)
+    _log_user(f"events clear before={raw} deleted={n}")
+    return {"deleted": n, "before": raw, "cutoff_iso": cutoff_iso}
 
 
 @app.get("/api/registry.xlsx")
@@ -614,6 +735,14 @@ async def ws_endpoint(ws: WebSocket):
                 repo = msg.get("repository")
                 if repo is None or isinstance(repo, str):
                     job.set_listener_repository(q, repo)
+                    # Audit which repository this client is now scoped to.
+                    # We don't log every reconnect's initial subscribe to
+                    # avoid noise; still, logging it here gives a useful
+                    # trace when debugging.
+                    _log_user(
+                        f"ws subscribe repository="
+                        + (repr(repo) if repo is not None else "None")
+                    )
                     # Send an immediate scoped snapshot so the UI updates fast.
                     try:
                         snap = job.snapshot(repository=repo).model_dump()

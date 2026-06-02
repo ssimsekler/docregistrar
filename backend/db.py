@@ -1,10 +1,13 @@
 """SQLite-backed storage for file records, repository master data, and job state.
 
-Schema v4 (current): like v3 but with the redundant `indexed_at` column
-removed. The two timestamps `indexing_started_at` and
-`indexing_completed_at` are sufficient. v4 migration drops the column from
-existing databases via a copy-and-rename; v3-only databases are silently
-upgraded.
+Schema v5 (current): adds the `event_log` table for persistent activity-
+log lines (worker steps + user actions). The migration is purely additive
+(CREATE TABLE IF NOT EXISTS); no existing rows are touched.
+
+Schema v4: like v3 but with the redundant `indexed_at` column removed. The
+two timestamps `indexing_started_at` and `indexing_completed_at` are
+sufficient. v4 migration drops the column from existing databases via a
+copy-and-rename; v3-only databases are silently upgraded.
 
 Schema v3: files keyed by `id` (UUID4-equivalent, 32 hex chars), with
 UNIQUE(repository, relative_path). Repository is now a column (was
@@ -37,7 +40,7 @@ from .schemas import (
 
 log = logging.getLogger("docregistrar.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _FILES_COLUMNS_SQL = """
     id              TEXT PRIMARY KEY,
@@ -79,6 +82,14 @@ CREATE TABLE IF NOT EXISTS repositories (
     description TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS event_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    category TEXT NOT NULL DEFAULT 'worker',
+    message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_log_ts ON event_log(ts);
 """
 
 
@@ -222,6 +233,14 @@ class Database:
                     CREATE INDEX IF NOT EXISTS idx_files_dup        ON files(is_duplicate);
                     CREATE INDEX IF NOT EXISTS idx_files_repo       ON files(repository);
                     CREATE INDEX IF NOT EXISTS idx_files_repo_path  ON files(repository, relative_path);
+                    CREATE TABLE IF NOT EXISTS event_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT NOT NULL,
+                        level TEXT NOT NULL DEFAULT 'info',
+                        category TEXT NOT NULL DEFAULT 'worker',
+                        message TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_event_log_ts ON event_log(ts);
                     """
                 )
 
@@ -1251,6 +1270,75 @@ class Database:
                         )"""
                 )
         return n
+
+    # ---------- event_log (persistent activity log) ----------
+
+    def append_event(self, level: str, category: str, message: str) -> None:
+        """Append one row to the event_log. Best-effort: failures are logged
+        but never raised (the worker MUST keep running even if disk is full).
+        """
+        if not message:
+            return
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO event_log(ts, level, category, message) VALUES(?,?,?,?)",
+                    (_utc_iso(), str(level or "info"), str(category or "worker"), str(message)),
+                )
+        except Exception:
+            # Don't let logging take down the worker.
+            log.exception("append_event failed (level=%r, category=%r)", level, category)
+
+    def list_events(self, *, limit: int = 1000,
+                    since_iso: Optional[str] = None) -> list[dict]:
+        """Return the most recent event_log rows, newest-first.
+
+        Each item is a plain dict shaped like `EventLogEntry`. Returns
+        an empty list on any error.
+        """
+        limit = max(1, min(10000, int(limit or 1000)))
+        try:
+            with self.conn() as c:
+                if since_iso:
+                    rows = c.execute(
+                        "SELECT id, ts, level, category, message FROM event_log "
+                        "WHERE ts > ? ORDER BY id DESC LIMIT ?",
+                        (since_iso, limit),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT id, ts, level, category, message FROM event_log "
+                        "ORDER BY id DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                return [
+                    {
+                        "id": int(r["id"]),
+                        "ts": r["ts"] or "",
+                        "level": r["level"] or "info",
+                        "category": r["category"] or "worker",
+                        "message": r["message"] or "",
+                    }
+                    for r in rows
+                ]
+        except Exception:
+            log.exception("list_events failed")
+            return []
+
+    def delete_events_before(self, cutoff_iso: str) -> int:
+        """Delete every event_log row strictly older than `cutoff_iso`.
+
+        Returns the number of rows deleted (0 on any error).
+        """
+        if not cutoff_iso:
+            return 0
+        try:
+            with self.conn() as c:
+                cur = c.execute("DELETE FROM event_log WHERE ts < ?", (cutoff_iso,))
+                return int(cur.rowcount or 0)
+        except Exception:
+            log.exception("delete_events_before failed (cutoff=%r)", cutoff_iso)
+            return 0
 
 
 def _row_to_record(row: sqlite3.Row) -> FileRecord:

@@ -50,6 +50,7 @@ EDITABLE_KEYS: set[str] = {
     # Processing
     "processing.max_error_retries",
     "processing.keep_awake_while_running",
+    "processing.heartbeat_log_interval_seconds",
     "excel_write_every_n_files",
     # Text extraction
     "extract.head_chars",

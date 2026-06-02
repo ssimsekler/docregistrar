@@ -640,3 +640,74 @@ tbody tr.dup-row td { box-shadow: inset 3px 0 0 var(--amber); }
 .repo-pill .repo-pill-name { font-weight: 600; color: var(--accent-2); }
 .repo-pill .repo-pill-path { color: var(--muted); font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .repo-pill .repo-pill-empty { color: var(--amber); font-size: 12px; font-style: italic; }
+
+/* ---------- Settings dialog row layout ---------- */
+/* Each row: [key + chips] [input flex] [Save] [Reset]   then a
+   full-width help paragraph wrapped to its own line. The help div
+   gets flex-basis: 100% which forces a line break in the flex flow,
+   so help text can be arbitrarily long without crowding the buttons.
+   Buttons keep their natural size — no oversized Save anymore. */
+.setting-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  flex: 0 0 auto;
+}
+.setting-input {
+  flex: 1 1 240px;
+  min-width: 200px;
+  display: flex;
+  align-items: center;
+}
+.setting-input input[type="text"],
+.setting-input input[type="number"],
+.setting-input textarea {
+  width: 100%;
+}
+.setting-row > button {
+  flex: 0 0 auto;
+}
+.setting-help {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  padding-left: 2px;
+}
+
+/* ---------- Activity log toolbar (date + clear button) ---------- */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.log-toolbar .spacer { flex: 1; }
+.log-toolbar input[type="date"] {
+  padding: 3px 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  /* Keep the picker icon visible on the dark theme */
+  color-scheme: dark;
+}
+.log-toolbar button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
