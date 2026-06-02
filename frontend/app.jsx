@@ -1397,7 +1397,21 @@ function App() {
         try {
           const m = JSON.parse(ev.data);
           if (m.type === "progress") {
-            setProgress(m.data);
+            // If no repository is selected, the subscription went out
+            // as `null` and the server replied with GLOBAL counts. We
+            // don't want to display those as if they belonged to a
+            // selection -- zero the count fields and keep only the
+            // run-state / current-file fields. The state pill and the
+            // active-run pill (📦) still reflect what's running.
+            if (!repositoryRef.current) {
+              setProgress({
+                ...m.data,
+                total: 0, done: 0, error: 0,
+                skipped: 0, pending: 0, processing: 0,
+              });
+            } else {
+              setProgress(m.data);
+            }
             // NB: we deliberately do NOT auto-adopt the active run's
             // repository into the user's selection here. The user's
             // Clear / pick should be honored. The header status pill
