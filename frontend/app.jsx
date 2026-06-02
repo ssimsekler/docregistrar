@@ -917,7 +917,11 @@ const SETTINGS_GROUPS = [
   },
   {
     name: "Processing",
-    keys: ["processing.max_error_retries", "excel_write_every_n_files"],
+    keys: [
+      "processing.max_error_retries",
+      "processing.keep_awake_while_running",
+      "excel_write_every_n_files",
+    ],
   },
   {
     name: "Text extraction",
@@ -977,6 +981,8 @@ const SETTINGS_HELP = {
     "Total wall-clock time budget (seconds) for ALL LLM activity on a single file (chunk calls + reduce, including retries). When exceeded, the file is marked 'error' with 'llm_total_timeout'. Default 60000 (~16.7h) acts as a safety net; tighten it to e.g. 600 if you want a hard cap per file.",
   "processing.max_error_retries":
     "After this many consecutive failures, the file is no longer auto-retried. Set its status to 'pending' or Re-evaluate to clear the counter.",
+  "processing.keep_awake_while_running":
+    "Prevent the OS from sleeping while the worker is running. On Windows this calls SetThreadExecutionState so system sleep is suppressed; the display can still turn off. Auto-released when the worker idles or stops. No-op on non-Windows. Recommended ON: a sleeping laptop typically kills the in-flight file with llm_transport_error / extraction_timeout when it wakes.",
   "excel_write_every_n_files":
     "Refresh the on-disk registry.xlsx after this many files complete (and at end of run).",
   "extract.head_chars": "Characters from the start of the document sent to the LLM.",

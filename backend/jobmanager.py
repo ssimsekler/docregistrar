@@ -31,6 +31,7 @@ from .extractors import (
     extract_any,
     truncate_head_middle_tail,
 )
+from .keep_awake import KeepAwake
 from .llm import (
     LLMCancelled,
     LLMError,
@@ -115,6 +116,11 @@ class JobManager:
         # Reference to the live LM Studio client so Stop can close its socket
         # to interrupt an in-flight LLM call.
         self._llm_client: Optional[LMClient] = None
+
+        # OS-sleep suppressor. Acquired in _run() while the worker thread
+        # is alive (if cfg.processing.keep_awake_while_running is True),
+        # released when the thread exits.
+        self._keep_awake = KeepAwake()
 
         # Bridge for WebSocket: list of asyncio.Queue, populated from any thread.
         self._listeners: list[asyncio.Queue] = []
@@ -387,6 +393,22 @@ class JobManager:
     # --------------- worker thread ---------------
 
     def _run(self) -> None:
+        # Acquire OS-sleep suppressor (Windows) so the laptop won't go to
+        # sleep mid-extraction. Released in the finally block so normal
+        # sleep policy is restored when the worker idles or stops.
+        keep_awake_acquired = False
+        try:
+            if self.cfg.processing.keep_awake_while_running:
+                keep_awake_acquired = self._keep_awake.acquire()
+                if not keep_awake_acquired and self._keep_awake.supported:
+                    log.warning(
+                        "keep_awake_while_running is enabled but the OS "
+                        "sleep suppressor could not be acquired; the laptop "
+                        "may still sleep mid-extraction."
+                    )
+        except Exception:
+            log.exception("Keep-awake acquire failed; continuing without it.")
+
         try:
             with self._lock:
                 skip_scan = self._state.skip_scan
@@ -408,6 +430,10 @@ class JobManager:
                     self._state.current_file = ""
                     self._state.current_file_progress = None
             self._broadcast_progress()
+            try:
+                self._keep_awake.release()
+            except Exception:
+                log.exception("Keep-awake release failed.")
             log.info("Worker thread exiting.")
 
     def _scan_target_folder(self) -> None:

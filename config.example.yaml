@@ -109,6 +109,17 @@ ignore_dir_names:
 # Excel write cadence: regenerate registry.xlsx every N completed files (and at end).
 excel_write_every_n_files: 10
 
+# Processing-related options.
+processing:
+  # If true, prevent the OS from sleeping while the worker is running.
+  # On Windows this calls SetThreadExecutionState(ES_CONTINUOUS |
+  # ES_SYSTEM_REQUIRED) so the system stays awake (display can still
+  # turn off). The lock is released as soon as the worker finishes or
+  # idles. On non-Windows platforms this is a no-op. Without this, a
+  # laptop that sleeps mid-extraction typically kills the in-flight
+  # file with llm_transport_error / extraction_timeout when it wakes.
+  keep_awake_while_running: true
+
 # Web app
 server:
   host: "127.0.0.1"

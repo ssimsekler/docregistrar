@@ -90,6 +90,15 @@ class ProcessingConfig(BaseModel):
     # (and the oldest last_error_at within that group), so transient flaps don't
     # exhaust their attempts before the cluster gets re-tried.
     max_error_retries: int = 5
+    # If True, prevent the OS from sleeping while the worker is running.
+    # On Windows this calls SetThreadExecutionState with ES_CONTINUOUS |
+    # ES_SYSTEM_REQUIRED so the system stays awake (display can still turn
+    # off). The lock is released as soon as the worker finishes or idles.
+    # On non-Windows platforms this is a no-op. Without this, a laptop that
+    # sleeps mid-extraction typically kills the in-flight file with
+    # llm_transport_error / extraction_timeout when it wakes (the OS pauses
+    # the process while time.monotonic continues).
+    keep_awake_while_running: bool = True
 
 
 class AppConfig(BaseModel):

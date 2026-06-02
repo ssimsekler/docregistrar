@@ -49,6 +49,7 @@ EDITABLE_KEYS: set[str] = {
     "llm.per_file_timeout_seconds",
     # Processing
     "processing.max_error_retries",
+    "processing.keep_awake_while_running",
     "excel_write_every_n_files",
     # Text extraction
     "extract.head_chars",
