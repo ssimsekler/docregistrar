@@ -63,7 +63,8 @@ COLUMNS: list[tuple[str, int]] = [
     ("Manually edited", 12),
     ("Status", 12),
     ("Error", 30),
-    ("Indexed at", 20),
+    ("Indexing started", 20),
+    ("Indexing completed", 20),
     ("Custom properties", 60),
 ]
 
@@ -150,7 +151,8 @@ def _record_to_row(rec: FileRecord, repo_paths: dict[str, str] | None = None) ->
         ("Yes" if rec.manually_edited else ""),
         rec.status,
         rec.error or "",
-        rec.indexed_at or "",
+        rec.indexing_started_at or "",
+        rec.indexing_completed_at or "",
         _format_custom_properties(e.custom_properties) if e else "",
     ]
 

@@ -108,7 +108,6 @@ class FileRecord(BaseModel):
     error: str = ""
     error_count: int = 0                    # consecutive automatic-retry failures (cleared on success / re-eval)
     last_error_at: Optional[str] = None     # ISO datetime of the most recent error
-    indexed_at: Optional[str] = None
     indexing_started_at: Optional[str] = None   # ISO datetime with TZ when processing began
     indexing_completed_at: Optional[str] = None  # ISO datetime with TZ when processing finished
     extraction: Optional[LLMExtraction] = None

@@ -1,7 +1,13 @@
 """SQLite-backed storage for file records, repository master data, and job state.
 
-Schema v3 (current): files keyed by `id` (UUID4-equivalent, 32 hex chars),
-with UNIQUE(repository, relative_path). Repository is now a column (was
+Schema v4 (current): like v3 but with the redundant `indexed_at` column
+removed. The two timestamps `indexing_started_at` and
+`indexing_completed_at` are sufficient. v4 migration drops the column from
+existing databases via a copy-and-rename; v3-only databases are silently
+upgraded.
+
+Schema v3: files keyed by `id` (UUID4-equivalent, 32 hex chars), with
+UNIQUE(repository, relative_path). Repository is now a column (was
 previously inside extraction_json). Adds error_count + last_error_at for
 automatic-retry capping.
 """
@@ -31,7 +37,7 @@ from .schemas import (
 
 log = logging.getLogger("docregistrar.db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _FILES_COLUMNS_SQL = """
     id              TEXT PRIMARY KEY,
@@ -49,7 +55,6 @@ _FILES_COLUMNS_SQL = """
     error           TEXT NOT NULL DEFAULT '',
     error_count     INTEGER NOT NULL DEFAULT 0,
     last_error_at   TEXT,
-    indexed_at      TEXT,
     indexing_started_at   TEXT,
     indexing_completed_at TEXT,
     used_thinking   INTEGER NOT NULL DEFAULT 0,
@@ -143,10 +148,10 @@ def _strip_repo_from_extraction_json_text(raw: Optional[str]) -> Optional[str]:
 _FILES_INSERT_COLS = (
     "id, repository, relative_path, file_name, extension, file_size, sha256, "
     "relative_folder_path, page_count, os_created, os_modified, status, error, "
-    "error_count, last_error_at, indexed_at, indexing_started_at, indexing_completed_at, "
+    "error_count, last_error_at, indexing_started_at, indexing_completed_at, "
     "used_thinking, extraction_json, manually_edited, is_duplicate, duplicate_group"
 )
-_FILES_INSERT_PLACEHOLDERS = ",".join("?" * 23)
+_FILES_INSERT_PLACEHOLDERS = ",".join("?" * 22)
 
 
 class Database:
@@ -197,6 +202,13 @@ class Database:
                         "Back up state.db before re-running if you need a rollback."
                     )
                     self._migrate_to_v3(conn)
+                if current < 4:
+                    log.info(
+                        "Migrating files table to schema v4 (drops redundant "
+                        "indexed_at column; the two indexing_started_at / "
+                        "indexing_completed_at timestamps are sufficient)."
+                    )
+                    self._migrate_to_v4(conn)
                 conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS repositories (
@@ -232,6 +244,10 @@ class Database:
             )
 
     def _migrate_to_v3(self, conn: sqlite3.Connection) -> None:
+        # Note: this migration creates the v4-shaped target table directly
+        # (no `indexed_at` column). The legacy column is dropped silently;
+        # the two `indexing_*` timestamps are sufficient. Pre-v3 databases
+        # therefore skip straight to v4.
         conn.execute("DROP TABLE IF EXISTS files_new")
         conn.execute(f"CREATE TABLE files_new ({_FILES_COLUMNS_SQL})")
 
@@ -255,7 +271,6 @@ class Database:
                 {rfp} AS relative_folder_path,
                 page_count, os_created, os_modified, status, error,
                 0 AS error_count, NULL AS last_error_at,
-                indexed_at,
                 {idx_started} AS indexing_started_at,
                 {idx_completed} AS indexing_completed_at,
                 used_thinking, extraction_json,
@@ -288,7 +303,7 @@ class Database:
                     r["page_count"], r["os_created"], r["os_modified"],
                     r["status"], r["error"] or "",
                     0, None,
-                    r["indexed_at"], r["indexing_started_at"], r["indexing_completed_at"],
+                    r["indexing_started_at"], r["indexing_completed_at"],
                     int(r["used_thinking"] or 0),
                     ext_json_clean,
                     int(r["manually_edited"] or 0),
@@ -299,6 +314,41 @@ class Database:
 
         conn.execute("DROP TABLE files")
         conn.execute("ALTER TABLE files_new RENAME TO files")
+
+    def _migrate_to_v4(self, conn: sqlite3.Connection) -> None:
+        """Drop the redundant `indexed_at` column from the v3 files table.
+
+        SQLite supports `ALTER TABLE ... DROP COLUMN` since 3.35 (Mar 2021),
+        which Python's bundled sqlite3 has since 3.11. We still detect the
+        column first so the migration is idempotent on hand-modified DBs.
+        """
+        existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+        if "indexed_at" not in existing_cols:
+            return
+        try:
+            conn.execute("ALTER TABLE files DROP COLUMN indexed_at")
+            log.info("Schema v4: dropped column 'indexed_at' from files.")
+        except sqlite3.OperationalError as e:
+            # Older SQLite without DROP COLUMN support: fall back to copy+rename.
+            log.info(
+                "ALTER TABLE DROP COLUMN failed (%s); falling back to "
+                "copy-and-rename to drop indexed_at.", e,
+            )
+            conn.execute("DROP TABLE IF EXISTS files_new")
+            conn.execute(f"CREATE TABLE files_new ({_FILES_COLUMNS_SQL})")
+            conn.execute(
+                f"""INSERT INTO files_new ({_FILES_INSERT_COLS})
+                    SELECT id, repository, relative_path, file_name, extension,
+                           file_size, sha256, relative_folder_path, page_count,
+                           os_created, os_modified, status, error, error_count,
+                           last_error_at, indexing_started_at, indexing_completed_at,
+                           used_thinking, extraction_json, manually_edited,
+                           is_duplicate, duplicate_group
+                      FROM files"""
+            )
+            conn.execute("DROP TABLE files")
+            conn.execute("ALTER TABLE files_new RENAME TO files")
+            log.info("Schema v4: rebuilt files table without 'indexed_at'.")
 
     # ---------- meta ----------
 
@@ -528,7 +578,7 @@ class Database:
                         new_id, repository, relative_path, file_name, extension,
                         file_size, sha256, relative_folder_path,
                         None, os_created, os_modified, "pending", "",
-                        0, None, None, None, None,
+                        0, None, None, None,
                         0, None, 0, 0, "",
                     ),
                 )
@@ -540,7 +590,8 @@ class Database:
                           SET file_size=?, sha256=?, os_created=?, os_modified=?,
                               relative_folder_path=?,
                               status='pending', error='', extraction_json=NULL,
-                              indexed_at=NULL, used_thinking=0,
+                              indexing_started_at=NULL, indexing_completed_at=NULL,
+                              used_thinking=0,
                               error_count=0, last_error_at=NULL
                         WHERE id=?""",
                     (file_size, sha256, os_created, os_modified,
@@ -646,7 +697,8 @@ class Database:
                 cur = c.execute(
                     """UPDATE files
                           SET status='pending', error='', extraction_json=NULL,
-                              indexed_at=NULL, used_thinking=0,
+                              indexing_started_at=NULL, indexing_completed_at=NULL,
+                              used_thinking=0,
                               manually_edited=0,
                               error_count=0, last_error_at=NULL
                         WHERE id=?""",
@@ -710,14 +762,13 @@ class Database:
             c.execute(
                 """UPDATE files
                       SET page_count=?, extraction_json=?, status='done', error='',
-                          indexed_at=?, used_thinking=?, indexing_completed_at=?,
+                          used_thinking=?, indexing_completed_at=?,
                           error_count=0, last_error_at=NULL,
                           repository=?
                     WHERE id=?""",
                 (
                     page_count,
                     extraction.model_dump_json(),
-                    now_iso(),
                     1 if used_thinking else 0,
                     completed,
                     new_repo,
@@ -799,7 +850,8 @@ class Database:
                     # Re-queue: clear extracted data, manual flag, and error counters.
                     sets = [
                         "manually_edited=0", "status=?", "extraction_json=NULL",
-                        "indexed_at=NULL", "used_thinking=0", "error=''",
+                        "indexing_started_at=NULL", "indexing_completed_at=NULL",
+                        "used_thinking=0", "error=''",
                         "error_count=0", "last_error_at=NULL",
                     ]
                     params = [new_status]
@@ -824,8 +876,10 @@ class Database:
         in that repository; otherwise rows are looked up by relative_path
         (skipped if ambiguous).
         Repository-only edits do NOT set manually_edited=1.
-        Status changes set manually_edited=1 (except status='pending', which
-        clears the flag and re-queues).
+        Status changes do NOT set manually_edited=1 either: changing status
+        is treated as a workflow operation (the LLM-generated content is
+        unchanged). Status='pending' additionally clears the flag and
+        re-queues the file (drops cached extraction).
         """
         n = 0
         with self.conn() as c:
@@ -845,15 +899,21 @@ class Database:
                         c.execute(
                             """UPDATE files
                                   SET status='pending', error='',
-                                      extraction_json=NULL, indexed_at=NULL,
+                                      extraction_json=NULL,
+                                      indexing_started_at=NULL,
+                                      indexing_completed_at=NULL,
                                       used_thinking=0, manually_edited=0,
                                       error_count=0, last_error_at=NULL
                                 WHERE id=?""",
                             (file_id,),
                         )
                     else:
+                        # Q8: setting a status (e.g. 'done', 'error',
+                        # 'skipped') in bulk does NOT mark the row as
+                        # manually edited. The LLM-extracted content is
+                        # unchanged; only the workflow state is.
                         c.execute(
-                            "UPDATE files SET status=?, manually_edited=1 WHERE id=?",
+                            "UPDATE files SET status=? WHERE id=?",
                             (status, file_id),
                         )
 
@@ -946,12 +1006,12 @@ class Database:
             cur = c.execute(
                 """UPDATE files
                       SET extraction_json=?, page_count=?, status='done', error='',
-                          indexed_at=?, indexing_started_at=?, indexing_completed_at=?,
+                          indexing_started_at=?, indexing_completed_at=?,
                           used_thinking=0, manually_edited=0,
                           error_count=0, last_error_at=NULL,
                           repository=?
                     WHERE id=?""",
-                (ext_json, src["page_count"], now_iso(), ts, ts, new_repo, target_id),
+                (ext_json, src["page_count"], ts, ts, new_repo, target_id),
             )
             return cur.rowcount > 0
 
@@ -1230,7 +1290,6 @@ def _row_to_record(row: sqlite3.Row) -> FileRecord:
         error=row["error"] or "",
         error_count=int(_opt("error_count", 0) or 0),
         last_error_at=_opt("last_error_at"),
-        indexed_at=row["indexed_at"],
         indexing_started_at=_opt("indexing_started_at"),
         indexing_completed_at=_opt("indexing_completed_at"),
         extraction=extraction,

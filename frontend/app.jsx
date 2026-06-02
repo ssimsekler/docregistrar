@@ -60,6 +60,16 @@ const LIST_FIELDS = [
 const STATUS_OPTIONS = ["pending", "done", "error", "skipped"];
 const MAX_CUSTOM_PROPERTIES = 50;
 
+// Small wrapper around window.confirm so confirmation prompts are
+// consistent and easy to centralize / replace later.
+function confirmAction(message) {
+  try {
+    return window.confirm(message);
+  } catch {
+    return true;
+  }
+}
+
 function PropRow({ label, value }) {
   if (value === undefined || value === null || value === "" ||
       (Array.isArray(value) && value.length === 0)) {
@@ -507,6 +517,21 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
       return;
     }
 
+    // If the user is changing the workflow status, ask explicitly --
+    // status changes are workflow operations that may re-process the
+    // file ('pending') or hide it ('skipped'), so they're worth
+    // confirming separately from generic field edits.
+    if (payload.status && payload.status !== rec.status) {
+      const extra = payload.status === "pending"
+        ? "\n\nNote: setting status to 'pending' will re-process this file (cached extraction is dropped)."
+        : payload.status === "skipped"
+          ? "\n\nNote: 'skipped' files are excluded from auto-processing and don't count towards % done."
+          : "";
+      if (!confirmAction(
+        `Change status from "${rec.status}" to "${payload.status}"?${extra}`
+      )) return;
+    }
+
     try {
       await api("POST", `/api/file/edit?relative_path=${encodeURIComponent(relativePath)}`, payload);
       setEditing(false);
@@ -542,8 +567,22 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
               title="Open the OS file explorer at this file's folder">
             📁 Open location
           </button>}
-          {!editing && <button onClick={() => onReevaluate(relativePath, false)} title="Re-evaluate">↻ Re-eval</button>}
-          {!editing && <button onClick={() => onReevaluate(relativePath, true)} title="Re-evaluate with thinking">↻ + 🧠</button>}
+          {!editing && <button
+              onClick={() => {
+                if (!confirmAction(
+                  `Re-evaluate this file?\n\n${relativePath}\n\nIt will be queued for re-processing.`
+                )) return;
+                onReevaluate(relativePath, false);
+              }}
+              title="Re-evaluate">↻ Re-eval</button>}
+          {!editing && <button
+              onClick={() => {
+                if (!confirmAction(
+                  `Re-evaluate this file with thinking mode (slower, smarter)?\n\n${relativePath}`
+                )) return;
+                onReevaluate(relativePath, true);
+              }}
+              title="Re-evaluate with thinking">↻ + 🧠</button>}
           {!editing && <button className="danger"
               onClick={async () => {
                 if (!confirm(
@@ -579,6 +618,10 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
                   style={{ marginLeft: "auto" }}
                   title="Skip this file. Processing stops at the next safe checkpoint and the file is marked as 'skipped'."
                   onClick={async () => {
+                    if (!confirmAction(
+                      `Skip the file currently being processed?\n\n${relativePath}\n\n` +
+                      `Processing will stop at the next safe checkpoint and the file will be marked as 'skipped'.`
+                    )) return;
                     try {
                       await api("POST", "/api/file/skip-current", { relative_path: relativePath });
                     } catch (err) {
@@ -702,7 +745,6 @@ function FileDetailPanel({ relativePath, currentProgress, onClose, onReevaluate,
             <PropRow label="SHA-256" value={rec.sha256} />
             <PropRow label="OS created" value={rec.os_created} />
             <PropRow label="OS modified" value={rec.os_modified} />
-            <PropRow label="Indexed at" value={rec.indexed_at} />
             <PropRow label="Indexing started" value={rec.indexing_started_at} />
             <PropRow label="Indexing completed" value={rec.indexing_completed_at} />
             <PropRow label="Used thinking" value={rec.used_thinking ? "Yes" : "No"} />
@@ -1299,51 +1341,105 @@ function App() {
     return () => clearInterval(id);
   }, []);
 
+  // Track the current repository in a ref so the WS reconnect handler can
+  // resubscribe with the latest value without re-creating the connection
+  // every time the user switches repositories.
+  const repositoryRef = useRef(repository);
+  useEffect(() => { repositoryRef.current = repository; }, [repository]);
+
   useEffect(() => {
     api("GET", "/api/config").then(c => setConfig(c)).catch(console.error);
 
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws`);
-    wsRef.current = ws;
-    ws.onopen = () => {
-      // Initial subscription. Reflects whatever repo the user starts with;
-      // a separate effect re-subscribes whenever the selection changes.
-      try {
-        ws.send(JSON.stringify({ type: "subscribe", repository: repository || null }));
-      } catch {}
+    let cancelled = false;
+    let reconnectTimer = null;
+    let reconnectAttempt = 0;
+
+    const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 10000];
+
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      const delay = RECONNECT_DELAYS_MS[
+        Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)
+      ];
+      reconnectAttempt += 1;
+      console.log(
+        `WS scheduling reconnect attempt ${reconnectAttempt} in ${delay}ms`
+      );
+      reconnectTimer = setTimeout(connect, delay);
     };
-    ws.onmessage = (ev) => {
+
+    const connect = () => {
+      if (cancelled) return;
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      let ws;
       try {
-        const m = JSON.parse(ev.data);
-        if (m.type === "progress") {
-          setProgress(m.data);
-          // If the worker is running and broadcasting a repository, sync our
-          // header selection so the UI reflects what's actually being processed.
-          if (m.data.repository && !repository) {
-            setRepository(m.data.repository);
-          }
-          const msg = m.data.last_message;
-          if (msg) {
-            const v = verbosityRef.current;
-            const isStepMsg = msg.startsWith("  [") || msg.startsWith("  ");
-            const isBegin = msg.startsWith("Begin: ");
-            let allow = true;
-            if (v === "quiet") allow = !isStepMsg && !isBegin;
-            else if (v === "normal") allow = !isStepMsg;
-            if (allow) {
-              setLogLines(prev => {
-                const last = prev[prev.length - 1];
-                if (last && last.text === msg) return prev;
-                const next = [...prev, { ts: new Date().toLocaleTimeString(), text: msg }];
-                return next.slice(-1000);
-              });
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+      } catch (e) {
+        console.warn("WS construction failed:", e);
+        scheduleReconnect();
+        return;
+      }
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        reconnectAttempt = 0; // reset backoff on successful open
+        // Subscribe to the user's currently-selected repository (read from
+        // the ref so we don't hold a stale closure).
+        try {
+          ws.send(JSON.stringify({
+            type: "subscribe",
+            repository: repositoryRef.current || null,
+          }));
+        } catch {}
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const m = JSON.parse(ev.data);
+          if (m.type === "progress") {
+            setProgress(m.data);
+            // NB: we deliberately do NOT auto-adopt the active run's
+            // repository into the user's selection here. The user's
+            // Clear / pick should be honored. The header status pill
+            // and the worker's broadcast already show what's running.
+            const msg = m.data.last_message;
+            if (msg) {
+              const v = verbosityRef.current;
+              const isStepMsg = msg.startsWith("  [") || msg.startsWith("  ");
+              const isBegin = msg.startsWith("Begin: ");
+              let allow = true;
+              if (v === "quiet") allow = !isStepMsg && !isBegin;
+              else if (v === "normal") allow = !isStepMsg;
+              if (allow) {
+                setLogLines(prev => {
+                  const last = prev[prev.length - 1];
+                  if (last && last.text === msg) return prev;
+                  const next = [...prev, { ts: new Date().toLocaleTimeString(), text: msg }];
+                  return next.slice(-1000);
+                });
+              }
             }
           }
-        }
-      } catch {}
+        } catch {}
+      };
+
+      ws.onerror = (e) => {
+        console.warn("WS error:", e?.message || "(no message)");
+      };
+
+      ws.onclose = (e) => {
+        console.log(`WS closed (code=${e?.code}, reason=${e?.reason || "n/a"})`);
+        if (!cancelled) scheduleReconnect();
+      };
     };
-    ws.onclose = () => console.log("WS closed");
-    return () => { try { ws.close(); } catch {} };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { wsRef.current && wsRef.current.close(); } catch {}
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1355,6 +1451,17 @@ function App() {
     try {
       ws.send(JSON.stringify({ type: "subscribe", repository: repository || null }));
     } catch {}
+  }, [repository]);
+
+  // Whenever the user clears the selection, immediately blank the repo-
+  // scoped progress numbers so we don't keep showing stale counts. The
+  // state pill / current-file pill follow the active run via the WS push.
+  useEffect(() => {
+    if (repository) return;
+    setProgress(prev => ({
+      ...prev,
+      total: 0, done: 0, error: 0, skipped: 0, pending: 0, processing: 0,
+    }));
   }, [repository]);
 
   const refreshFiles = useCallback(async () => {
@@ -1379,6 +1486,10 @@ function App() {
   }, [refreshFiles]);
 
   useEffect(() => {
+    // Don't poll when no repository is selected: showing global counts
+    // briefly on first load (or after Clear) is misleading. The user
+    // gets 0s + a "Select a repository" hint until they pick one.
+    if (!repository) return undefined;
     let aborted = false;
     const tickProgress = async () => {
       try {
@@ -1386,11 +1497,14 @@ function App() {
         // 3-second poll doesn't clobber the (correctly scoped) WebSocket
         // pushes whenever the user has picked a repository.
         const qs = new URLSearchParams();
-        qs.set("repository", (repository || "").trim());
+        qs.set("repository", repository.trim());
         const p = await api("GET", `/api/progress?${qs.toString()}`);
         if (!aborted) setProgress(p);
       } catch { /* ignore */ }
     };
+    // Fire one immediately on selection so the UI catches up quickly,
+    // then keep polling every 3s.
+    tickProgress();
     const id = setInterval(tickProgress, 3000);
     return () => { aborted = true; clearInterval(id); };
   }, [repository]);
@@ -1401,14 +1515,63 @@ function App() {
       alert(startDisabledReason);
       return;
     }
+    if (!confirmAction(
+      `Start processing repository "${repository.trim()}"?\n\n` +
+      `This will scan its folder and process all pending files.`
+    )) return;
     try {
       await api("POST", "/api/start", { repository: repository.trim() });
     } catch (e) { alert(e.message); }
   };
-  const onPause  = () => api("POST", "/api/pause").catch(e => alert(e.message));
-  const onResume = () => api("POST", "/api/resume").catch(e => alert(e.message));
-  const onStop   = () => api("POST", "/api/stop").catch(e => alert(e.message));
+  const onPause = async () => {
+    if (!confirmAction("Pause processing?\n\nYou can resume later.")) return;
+    try { await api("POST", "/api/pause"); }
+    catch (e) { alert(e.message); }
+  };
+  const onResume = async () => {
+    if (!confirmAction("Resume processing?")) return;
+    try { await api("POST", "/api/resume"); }
+    catch (e) { alert(e.message); }
+  };
+  const onStop = async () => {
+    if (!confirmAction(
+      "Stop processing?\n\n" +
+      "The file currently in flight (if any) will be requeued as 'pending'."
+    )) return;
+    try { await api("POST", "/api/stop"); }
+    catch (e) { alert(e.message); }
+  };
   const onDownload = () => { window.location.href = "/api/registry.xlsx"; };
+
+  // Clearing or switching the active repository selection. Both prompt
+  // the user; no-op if cancelled.
+  const onClearRepository = () => {
+    if (!confirmAction(
+      `Clear the selected repository?\n\n` +
+      `The file grid will switch to "files with no repository".`
+    )) return;
+    setRepository("");
+  };
+  const onPickRepository = (newName) => {
+    const name = (newName || "").trim();
+    if (!name) {
+      setRepoMgrOpen(false);
+      return;
+    }
+    if (repository && repository !== name) {
+      if (!confirmAction(
+        `Switch active repository from "${repository}" to "${name}"?\n\n` +
+        `Any current selection in the file table will be cleared.`
+      )) {
+        setRepoMgrOpen(false);
+        return;
+      }
+      setSelected(new Set());
+    }
+    setRepository(name);
+    setRepoMgrOpen(false);
+    refreshRepositories();
+  };
 
   const reevaluatePaths = async (paths, withThinking, force = false) => {
     try {
@@ -1467,6 +1630,19 @@ function App() {
       alert("Provide a repository value and/or pick a status.");
       return;
     }
+    // Build a confirmation summarising what's about to change.
+    const parts = [];
+    if (payload.repository !== undefined) {
+      parts.push(payload.repository === ""
+        ? `clear Repository (set to "")`
+        : `set Repository to "${payload.repository}"`);
+    }
+    if (payload.status !== undefined) {
+      parts.push(`set Status to "${payload.status}"`);
+    }
+    if (!confirmAction(
+      `Bulk edit ${selected.size} file(s):\n\n  • ${parts.join("\n  • ")}\n\nProceed?`
+    )) return;
     try {
       const r = await api("POST", "/api/files/bulk-edit", payload);
       alert(`Bulk-edited ${r.updated} file(s).`);
@@ -1535,7 +1711,16 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [progress.started_at, progress.state, tick]);
 
-  const pct = progress.total > 0 ? Math.round(((progress.done + progress.error) / progress.total) * 100) : 0;
+  // Effective % only counts files that *can* contribute to "done":
+  // skipped files are excluded from the denominator (so a repo with
+  // some Skipped files can still reach 100%). When no repository is
+  // selected we show 0% regardless (repo-scoped chips are at 0 too).
+  const noRepoSelected = !repository;
+  const skipped = Number(progress.skipped || 0);
+  const effectiveTotal = Math.max(0, Number(progress.total || 0) - skipped);
+  const pct = (!noRepoSelected && effectiveTotal > 0)
+    ? Math.round(100 * Number(progress.done || 0) / effectiveTotal)
+    : 0;
   const running = ["scanning", "running", "paused", "stopping"].includes(progress.state);
   const paused = progress.state === "paused";
   const cfp = progress.current_file_progress;
@@ -1562,12 +1747,18 @@ function App() {
               : <span className="repo-pill-empty">(none selected)</span>}
           </div>
           <button onClick={() => setRepoMgrOpen(true)}
-                  title="Open the repository management dialog (create / edit / delete / select)">
+                  disabled={running}
+                  title={running
+                    ? "Stop processing first to browse / change repositories"
+                    : "Open the repository management dialog (create / edit / delete / select)"}>
             🔎 Browse repos
           </button>
           {repository && (
-            <button onClick={() => setRepository("")}
-                    title="Clear the repository selection (the grid will then show files with no repository)">
+            <button onClick={onClearRepository}
+                    disabled={running}
+                    title={running
+                      ? "Stop processing first to clear the repository selection"
+                      : "Clear the repository selection (the grid will then show files with no repository)"}>
               ✕ Clear
             </button>
           )}
@@ -1605,6 +1796,7 @@ function App() {
           <span>⏳ pending: <b>{progress.pending}</b></span>
           <span>⚙️ processing: <b>{progress.processing}</b></span>
           <span>❌ errors: <b>{progress.error}</b></span>
+          <span>⏭ skipped: <b>{progress.skipped || 0}</b></span>
           <span>📈 {pct}%</span>
           {runElapsed && <span>⏱ elapsed: <b>{runElapsed}</b></span>}
           {cfp && cfp.relative_path && (
@@ -1871,11 +2063,7 @@ function App() {
       <RepositoryManagerDialog
         open={repoMgrOpen}
         currentSelection={repository}
-        onPick={(value) => {
-          setRepository(value);
-          setRepoMgrOpen(false);
-          refreshRepositories();
-        }}
+        onPick={onPickRepository}
         onChanged={(oldName, newName) => {
           // If the currently-selected repo got renamed or deleted, react.
           refreshRepositories();
