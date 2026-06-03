@@ -15,6 +15,42 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# Optional / version-tolerant imports for the WebSocket disconnect
+# exception types. Different stacks raise different concrete classes on
+# a normal client disconnect; we want to swallow them all silently so
+# the server console stays quiet.
+try:
+    from starlette.websockets import (
+        WebSocketDisconnect as _StarletteWSDisconnect,
+    )
+except Exception:  # pragma: no cover - starlette is always present
+    _StarletteWSDisconnect = WebSocketDisconnect  # type: ignore[assignment]
+
+try:
+    from websockets.exceptions import ConnectionClosedError as _WSClosedError
+    from websockets.exceptions import ConnectionClosedOK as _WSClosedOK
+except Exception:  # pragma: no cover
+    _WSClosedError = Exception  # type: ignore[assignment]
+    _WSClosedOK = Exception  # type: ignore[assignment]
+
+try:
+    # Newer Starlette / httpx-style
+    from starlette.requests import ClientDisconnect as _ClientDisconnect
+except Exception:  # pragma: no cover
+    _ClientDisconnect = Exception  # type: ignore[assignment]
+
+# Tuple used by ws_endpoint to recognise "client just went away" as a
+# non-error condition.
+_WS_DISCONNECT_EXCEPTIONS = (
+    WebSocketDisconnect,
+    _StarletteWSDisconnect,
+    _WSClosedError,
+    _WSClosedOK,
+    _ClientDisconnect,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
+
 from .config import PROJECT_ROOT, load_config
 from .db import Database
 from .excel_writer import build_registry_bytes
@@ -717,43 +753,71 @@ async def ws_endpoint(ws: WebSocket):
         pass
 
     # Coroutine that receives client messages (subscriptions) concurrently
-    # with the outbound progress stream.
+    # with the outbound progress stream. Both loops swallow client-
+    # disconnect exceptions silently: those are completely normal (e.g.
+    # browser tab closed, laptop slept). Any other unexpected exception
+    # is logged but never re-raised, so we never see the noisy
+    # "Task exception was never retrieved" tracebacks the asyncio
+    # runtime prints when a daemon task dies with an unhandled error.
     async def _recv_loop() -> None:
-        while True:
-            try:
-                msg_text = await ws.receive_text()
-            except WebSocketDisconnect:
-                raise
-            except Exception:
-                return
-            try:
-                msg = json.loads(msg_text)
-            except Exception:
-                continue
-            if isinstance(msg, dict) and msg.get("type") == "subscribe":
-                # `repository` may be None / omitted (= all repos) or a string.
-                repo = msg.get("repository")
-                if repo is None or isinstance(repo, str):
-                    job.set_listener_repository(q, repo)
-                    # Audit which repository this client is now scoped to.
-                    # We don't log every reconnect's initial subscribe to
-                    # avoid noise; still, logging it here gives a useful
-                    # trace when debugging.
-                    _log_user(
-                        f"ws subscribe repository="
-                        + (repr(repo) if repo is not None else "None")
-                    )
-                    # Send an immediate scoped snapshot so the UI updates fast.
-                    try:
-                        snap = job.snapshot(repository=repo).model_dump()
-                        await ws.send_text(json.dumps({"type": "progress", "data": snap}))
-                    except Exception:
-                        pass
+        try:
+            while True:
+                try:
+                    msg_text = await ws.receive_text()
+                except _WS_DISCONNECT_EXCEPTIONS:
+                    return
+                try:
+                    msg = json.loads(msg_text)
+                except Exception:
+                    continue
+                if isinstance(msg, dict) and msg.get("type") == "subscribe":
+                    # `repository` may be None / omitted (= all repos)
+                    # or a string.
+                    repo = msg.get("repository")
+                    if repo is None or isinstance(repo, str):
+                        job.set_listener_repository(q, repo)
+                        _log_user(
+                            f"ws subscribe repository="
+                            + (repr(repo) if repo is not None else "None")
+                        )
+                        # Send an immediate scoped snapshot so the UI
+                        # updates fast.
+                        try:
+                            snap = job.snapshot(repository=repo).model_dump()
+                            await ws.send_text(
+                                json.dumps({"type": "progress", "data": snap})
+                            )
+                        except _WS_DISCONNECT_EXCEPTIONS:
+                            return
+                        except Exception:
+                            log.exception(
+                                "ws _recv_loop: snapshot send failed"
+                            )
+        except _WS_DISCONNECT_EXCEPTIONS:
+            return
+        except asyncio.CancelledError:
+            # Normal cancellation when the peer task finishes first.
+            return
+        except Exception:
+            # Last-resort safety net: log, never re-raise.
+            log.exception("ws _recv_loop: unexpected")
+            return
 
     async def _send_loop() -> None:
-        while True:
-            payload = await q.get()
-            await ws.send_text(json.dumps(payload))
+        try:
+            while True:
+                payload = await q.get()
+                try:
+                    await ws.send_text(json.dumps(payload))
+                except _WS_DISCONNECT_EXCEPTIONS:
+                    return
+        except _WS_DISCONNECT_EXCEPTIONS:
+            return
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("ws _send_loop: unexpected")
+            return
 
     recv_task = asyncio.create_task(_recv_loop())
     send_task = asyncio.create_task(_send_loop())
@@ -763,7 +827,7 @@ async def ws_endpoint(ws: WebSocket):
         )
         for t in pending:
             t.cancel()
-    except WebSocketDisconnect:
+    except _WS_DISCONNECT_EXCEPTIONS:
         pass
     except asyncio.CancelledError:
         log.info("WebSocket cancelled (server shutdown).")
@@ -773,6 +837,15 @@ async def ws_endpoint(ws: WebSocket):
         for t in (recv_task, send_task):
             if not t.done():
                 t.cancel()
+        # Drain task results so asyncio doesn't print
+        # "Task exception was never retrieved" warnings if a task
+        # raised after we already returned. Both loops trap
+        # everything internally now, but this is the belt-and-braces
+        # contract: no orphan exceptions, ever.
+        try:
+            await asyncio.gather(recv_task, send_task, return_exceptions=True)
+        except Exception:
+            pass
         job.remove_listener(q)
         try:
             await ws.close()

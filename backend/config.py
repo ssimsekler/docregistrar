@@ -59,15 +59,22 @@ class LLMConfig(BaseModel):
     thinking_default: bool = False
     thinking_on_low_quality: bool = True
     low_quality_threshold: float = 0.6
-    max_output_tokens: int = 4096
+    # Bumped from 4096 → 6144: with thinking-mode and dense chunks the
+    # 4096-token cap was being eaten entirely by hidden reasoning
+    # tokens, leaving nothing for the JSON body and producing the
+    # `(empty response)` storm seen on 600-slide decks. 6144 with the
+    # default 8192-token context window leaves headroom on both sides.
+    max_output_tokens: int = 6144
     # Total wall-clock time budget (seconds) for ALL LLM activity on a
     # single file (chunk calls + reduce, including retries). Different
     # from `request_timeout_seconds` (which is per HTTP request). When
     # exceeded, the file is marked 'error' with 'llm_total_timeout'.
-    # Default is intentionally generous (~16.7 hours) so this acts as
-    # a safety net rather than an active limit; tighten it from the
-    # Settings dialog if you want a hard cap per file.
-    per_file_timeout_seconds: int = 60000
+    # Tightened from 60000 (~16.7 h, effectively disabled) → 3600 (1 h)
+    # so a stuck file fails over to the next one within an hour rather
+    # than burning a whole working day on a single document. Override
+    # via the Settings dialog if a specific repository legitimately
+    # needs more time.
+    per_file_timeout_seconds: int = 3600
     # Vision (multi-modal) settings for image files. See VisionConfig.
     vision: VisionConfig = Field(default_factory=VisionConfig)
 
@@ -85,8 +92,13 @@ class MapReduceConfig(BaseModel):
     # Documents with extracted text <= this length go through the
     # single-shot fast path. Above this they are chunked.
     threshold_chars: int = 10000
-    # Target size of each chunk (in characters).
-    chunk_chars: int = 10000
+    # Target size of each chunk (in characters). Lowered from 10 000 →
+    # 6 000: at 10 000 chars/chunk a dense product-feature listing
+    # could not be summarised within `per_chunk_max_output_tokens` and
+    # the model often returned `(empty response)`. 6 000 produces more
+    # chunks but each one finishes reliably, which is a much better
+    # trade on long runs.
+    chunk_chars: int = 6000
     # Overlap between consecutive chunks to avoid losing context across
     # boundaries.
     chunk_overlap_chars: int = 500
@@ -97,9 +109,11 @@ class MapReduceConfig(BaseModel):
     # fields. If False, narrative fields are merged deterministically
     # (less coherent but faster and zero hallucination risk).
     reduce_with_llm: bool = True
-    # Smaller output cap for chunk extractions (faster, less likely to
-    # truncate, since each chunk only needs partial fields).
-    per_chunk_max_output_tokens: int = 1500
+    # Output cap for chunk extractions. Bumped from 1500 → 2048: with
+    # the leak-aware prompt the chunk JSON is sometimes a bit larger
+    # (richer entity lists), and 2048 still leaves comfortable headroom
+    # under the global `llm.max_output_tokens=6144` cap.
+    per_chunk_max_output_tokens: int = 2048
 
 
 class ExtractConfig(BaseModel):

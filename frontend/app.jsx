@@ -60,6 +60,17 @@ const LIST_FIELDS = [
 const STATUS_OPTIONS = ["pending", "done", "error", "skipped"];
 const MAX_CUSTOM_PROPERTIES = 50;
 
+// In-memory cap on the Activity Log buffer. Bumped from the original
+// 1000 because long runs (12 h+) easily produce more than 1000
+// step/heartbeat lines and useful "[user]" / completion lines were
+// being pushed off the top. The persistent event_log on the server is
+// the source of truth for older lines.
+const LOG_BUFFER_MAX = 5000;
+
+// localStorage keys for UI preferences we want to survive reloads.
+const LS_VERBOSITY = "docregistrar.verbosity";
+const LS_HEARTBEATS = "docregistrar.showHeartbeats";
+
 // Small wrapper around window.confirm so confirmation prompts are
 // consistent and easy to centralize / replace later.
 function confirmAction(message) {
@@ -1268,8 +1279,39 @@ function App() {
   const [dupOnly, setDupOnly] = useState(false);
   const [selected, setSelected] = useState(new Set());
   const [logLines, setLogLines] = useState([]);
+  // Ref-mirror of logLines so async handlers (WS reconnect, replay) can
+  // read the latest tail without depending on a re-render. Note: state
+  // is still the source of truth for rendering; the ref only serves
+  // read-side helpers like the "since" parameter on /api/events.
+  const logLinesRef = useRef([]);
+  useEffect(() => { logLinesRef.current = logLines; }, [logLines]);
   const [useThinking, setUseThinking] = useState(false);
-  const [verbosity, setVerbosity] = useState("normal");
+  // Verbosity selector. Persisted in localStorage so the choice
+  // survives reloads (the previous behaviour reset it to "normal" on
+  // every refresh, hiding everything users had selected to see).
+  const [verbosity, setVerbosity] = useState(() => {
+    try {
+      const v = localStorage.getItem(LS_VERBOSITY);
+      if (v === "quiet" || v === "normal" || v === "verbose") return v;
+    } catch {}
+    return "normal";
+  });
+  useEffect(() => {
+    try { localStorage.setItem(LS_VERBOSITY, verbosity); } catch {}
+  }, [verbosity]);
+  // Independent toggle for heartbeat (`  [hb] LLM alive ...`) lines.
+  // Defaults OFF so a 12-hour run doesn't drown the panel in hundreds
+  // of "LLM alive" lines; users can flip it on when debugging a stuck
+  // chunk. Persisted alongside verbosity.
+  const [showHeartbeats, setShowHeartbeats] = useState(() => {
+    try { return localStorage.getItem(LS_HEARTBEATS) === "1"; }
+    catch { return false; }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_HEARTBEATS, showHeartbeats ? "1" : "0");
+    } catch {}
+  }, [showHeartbeats]);
   const [openedPath, setOpenedPath] = useState("");
   const [tick, setTick] = useState(0);
   const [bulkRepo, setBulkRepo] = useState("");
@@ -1293,6 +1335,56 @@ function App() {
   const wsRef = useRef(null);
   const verbosityRef = useRef(verbosity);
   useEffect(() => { verbosityRef.current = verbosity; }, [verbosity]);
+  // Mirror showHeartbeats into a ref so the ws.onmessage closure (which
+  // is captured once per connection) sees the latest user choice
+  // without us tearing down the WS on every toggle.
+  const showHeartbeatsRef = useRef(showHeartbeats);
+  useEffect(() => {
+    showHeartbeatsRef.current = showHeartbeats;
+  }, [showHeartbeats]);
+
+  // Helper: convert event_log items (newest-first from the API) into
+  // chronological { ts, text, tsRaw } shape we use in logLines. tsRaw
+  // is the unparsed ISO so the WS reconnect replay can ask the server
+  // for "everything since this timestamp".
+  const _eventsToLines = useCallback((items) => {
+    return (Array.isArray(items) ? items : [])
+      .slice()
+      .reverse()
+      .map(it => {
+        let ts = "";
+        try {
+          const d = new Date(it.ts);
+          ts = Number.isNaN(d.getTime()) ? (it.ts || "") : d.toLocaleTimeString();
+        } catch { ts = it.ts || ""; }
+        return { ts, tsRaw: it.ts || "", text: it.message || "" };
+      });
+  }, []);
+
+  // Generic "merge new lines into the existing buffer" routine. De-dupes
+  // by (tsRaw, text) tuple so reload + WS overlap doesn't show the same
+  // line twice. Caps the buffer at LOG_BUFFER_MAX.
+  const _mergeLogLines = useCallback((newLines, position = "append") => {
+    if (!newLines || newLines.length === 0) return;
+    setLogLines(prev => {
+      const seen = new Set();
+      for (const l of prev) {
+        seen.add(`${l.tsRaw || ""}|${l.text || ""}`);
+      }
+      const filtered = [];
+      for (const l of newLines) {
+        const key = `${l.tsRaw || ""}|${l.text || ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        filtered.push(l);
+      }
+      if (filtered.length === 0) return prev;
+      const merged = position === "prepend"
+        ? [...filtered, ...prev]
+        : [...prev, ...filtered];
+      return merged.slice(-LOG_BUFFER_MAX);
+    });
+  }, []);
 
   // Replay persisted activity-log events on mount so reloads / fresh
   // tabs show recent history (worker steps + [user] actions). Best
@@ -1300,27 +1392,13 @@ function App() {
   // its first push.
   useEffect(() => {
     let aborted = false;
-    api("GET", "/api/events?limit=1000")
+    api("GET", `/api/events?limit=${LOG_BUFFER_MAX}`)
       .then(r => {
         if (aborted) return;
-        const items = Array.isArray(r.items) ? r.items : [];
-        // The API returns newest-first; flip to chronological order so
-        // the panel reads top-to-bottom like the live stream does.
-        const lines = items
-          .slice()
-          .reverse()
-          .map(it => {
-            // Convert UTC ISO to a local time string for display.
-            let ts = "";
-            try {
-              const d = new Date(it.ts);
-              ts = Number.isNaN(d.getTime()) ? (it.ts || "") : d.toLocaleTimeString();
-            } catch { ts = it.ts || ""; }
-            return { ts, text: it.message || "" };
-          });
-        // Prepend (the WS may have already pushed a few new lines on top
-        // of these). Cap at 1000 to match the live cap.
-        setLogLines(prev => [...lines, ...prev].slice(-1000));
+        const lines = _eventsToLines(r.items);
+        // Prepend in case the WS has already pushed a few new lines on
+        // top of these. _mergeLogLines de-dupes by (tsRaw, text).
+        _mergeLogLines(lines, "prepend");
       })
       .catch(() => { /* persisted log unavailable; ignore */ });
     return () => { aborted = true; };
@@ -1464,6 +1542,27 @@ function App() {
             repository: repositoryRef.current || null,
           }));
         } catch {}
+        // Replay any persisted lines we may have missed during the
+        // disconnect. This is the fix for the "4½-hour gap" symptom:
+        // when a laptop sleeps + wakes, the WS drops and reconnects,
+        // but lines emitted in between never reach the in-memory log.
+        // We ask the server for everything strictly newer than our
+        // most recent in-memory line (tsRaw is the original ISO from
+        // event_log), and merge them in chronologically.
+        try {
+          const tail = logLinesRef.current;
+          const lastTsRaw =
+            tail.length > 0 ? (tail[tail.length - 1].tsRaw || "") : "";
+          const url = lastTsRaw
+            ? `/api/events?limit=${LOG_BUFFER_MAX}&since=${encodeURIComponent(lastTsRaw)}`
+            : `/api/events?limit=${LOG_BUFFER_MAX}`;
+          api("GET", url)
+            .then(r => {
+              const lines = _eventsToLines(r.items);
+              _mergeLogLines(lines, "append");
+            })
+            .catch(() => { /* persisted log unavailable; ignore */ });
+        } catch { /* paranoid: never let replay break the WS open */ }
       };
 
       ws.onmessage = (ev) => {
@@ -1492,17 +1591,44 @@ function App() {
             const msg = m.data.last_message;
             if (msg) {
               const v = verbosityRef.current;
-              const isStepMsg = msg.startsWith("  [") || msg.startsWith("  ");
+              // Heartbeat (`  [hb] LLM alive ...`) lines are MUCH
+              // noisier than ordinary step lines; we treat them as a
+              // separate axis controlled by the showHeartbeats toggle
+              // (default OFF). Step lines are everything else that
+              // starts with two leading spaces (the worker convention
+              // for "this is a sub-step").
+              const isHeartbeat = msg.startsWith("  [hb]");
+              const isStepMsg =
+                (msg.startsWith("  [") || msg.startsWith("  "))
+                && !isHeartbeat;
               const isBegin = msg.startsWith("Begin: ");
               let allow = true;
-              if (v === "quiet") allow = !isStepMsg && !isBegin;
-              else if (v === "normal") allow = !isStepMsg;
+              if (v === "quiet") {
+                allow = !isStepMsg && !isBegin && !isHeartbeat;
+              } else if (v === "normal") {
+                // Normal hides ordinary step lines entirely; heartbeats
+                // are gated by the dedicated toggle.
+                allow = !isStepMsg && (showHeartbeatsRef.current || !isHeartbeat);
+              } else /* verbose */ {
+                allow = showHeartbeatsRef.current || !isHeartbeat;
+              }
               if (allow) {
                 setLogLines(prev => {
                   const last = prev[prev.length - 1];
                   if (last && last.text === msg) return prev;
-                  const next = [...prev, { ts: new Date().toLocaleTimeString(), text: msg }];
-                  return next.slice(-1000);
+                  // Live messages don't carry a server-side ISO ts; we
+                  // tag them with tsRaw="" so the de-dupe in
+                  // _mergeLogLines won't conflict with a future
+                  // /api/events replay (which DOES carry a tsRaw).
+                  const next = [
+                    ...prev,
+                    {
+                      ts: new Date().toLocaleTimeString(),
+                      tsRaw: "",
+                      text: msg,
+                    },
+                  ];
+                  return next.slice(-LOG_BUFFER_MAX);
                 });
               }
             }
@@ -1965,11 +2091,18 @@ function App() {
             )}
             <div className="spacer"></div>
             <label>Verbosity:</label>
-            <select value={verbosity} onChange={e => setVerbosity(e.target.value)}>
+            <select value={verbosity} onChange={e => setVerbosity(e.target.value)}
+                    title="quiet = only top-level messages; normal = + Begin/Done lines; verbose = + every step">
               <option value="quiet">quiet</option>
               <option value="normal">normal</option>
               <option value="verbose">verbose</option>
             </select>
+            <label title="Show '[hb] LLM alive ...' heartbeat lines in the activity log. Off by default — heartbeats are noisy on long runs.">
+              <input type="checkbox" className="checkbox"
+                     checked={showHeartbeats}
+                     onChange={e => setShowHeartbeats(e.target.checked)} />
+              {" "}heartbeats
+            </label>
             <label>
               <input type="checkbox" className="checkbox"
                      checked={useThinking}

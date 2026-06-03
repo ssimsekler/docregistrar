@@ -67,6 +67,13 @@ class LLMExtraction(BaseModel):
     source_url_3: str = ""
     custom_properties: list[KVPair] = Field(default_factory=list)  # user-defined K/V pairs
     error_history: list[ErrorEntry] = Field(default_factory=list)  # last N error attempts
+    # Optional non-fatal warning about an extraction that completed with
+    # status='done' but with a known quality concern (e.g.
+    # "low_chunk_yield: 50% of 60 chunks produced output"). Surfaced by
+    # the worker through the activity log and into the file row's
+    # `error` column so it shows up in the Excel and grid even though
+    # the row is not in error state.
+    extraction_warning: str = ""
 
 
 # Set of LLMExtraction fields that count as "generated attributes" (i.e.

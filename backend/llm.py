@@ -132,6 +132,23 @@ CHUNK-SPECIFIC RULES (very important):
   - "key_phrases" / "key_concepts" / "tags": at most 5 each per chunk.
   - "quality_score": your confidence in THIS chunk's extraction.
 
+CRITICAL OUTPUT-PHRASING RULES:
+  - NEVER use the words "chunk", "slice", or "this section/part of the
+    document" in any output field. NEVER reference slide ranges
+    ("slides 247-259") or the chunking strategy in the prose fields.
+  - The fields "title", "description", "summary" must read as if you
+    were describing the WHOLE document from the small portion you can
+    see — never as a slide-by-slide walkthrough or a summary of "this
+    chunk". If you cannot infer global properties (title, date,
+    document_type), leave them empty rather than describing only the
+    slice.
+  - Bad: "This chunk contains slides 247-259 covering ..." — leave
+    summary empty instead.
+  - Good: "" (empty) when nothing global can be said.
+  - Good: "Catalog of SAP S/4HANA Service capabilities including ..."
+    when the chunk is self-contained enough to describe at the global
+    level.
+
 Output: ONE JSON object only.
 """
 
@@ -203,6 +220,26 @@ class LLMInvalidJSONError(LLMError):
     def __init__(self, raw_snippet: str):
         self.raw_snippet = raw_snippet
         super().__init__("LLM did not return valid JSON. First 200 chars: " + repr(raw_snippet))
+
+
+class LLMEmptyResponseError(LLMError):
+    """LM returned HTTP 200 with an empty `content`.
+
+    This is a distinct, retryable failure mode (not "invalid JSON"):
+    the model has spent its entire `max_tokens` budget on hidden
+    reasoning tokens (Qwen3 <think>...</think>) and never emitted the
+    JSON body. Callers should retry with a larger token budget AND a
+    stronger anti-thinking directive before giving up. This is the
+    direct cause of the "30 chunks × ~700 s = 12 hours of empty
+    responses" symptom on the 600-slide Cloud-ERP deck.
+    """
+    def __init__(self, model: str = "", raw_snippet: str = ""):
+        self.model = model
+        self.raw_snippet = raw_snippet
+        super().__init__(
+            f"LLM returned HTTP 200 with empty content (model={model!r}); "
+            f"likely consumed entire token budget on hidden reasoning."
+        )
 
 
 class LLMSchemaError(LLMError):
@@ -398,6 +435,56 @@ def split_text_into_chunks(text: str, cfg: MapReduceConfig) -> list[str]:
 
 # --------------- deterministic merge ---------------
 
+# Regex catching the most common phrasings the LLM uses when it forgets
+# the chunk-prompt rules and leaks the chunking strategy into the prose
+# fields. Tuned to avoid scrubbing legitimate prose (e.g. "this section
+# covers" alone is a normal phrasing in real documents — we only react
+# when it co-occurs with a slide range or chunk-N-of-M marker).
+_LEAK_RE = re.compile(
+    r"\b(?:"
+    r"this\s+chunk"
+    r"|this\s+slice"
+    r"|chunk\s+\d+(?:\s*of\s*\d+)?"
+    r"|slides?\s+\d+\s*[-\u2013]\s*\d+"
+    r"|slide\s+\d+\s*content"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_chunk_leak(text: str) -> bool:
+    """Return True iff `text` contains a phrase that exposes the chunking
+    strategy (e.g. "This chunk contains slides 247-259 ...").
+    """
+    if not text:
+        return False
+    return _LEAK_RE.search(text) is not None
+
+
+def _scrub_chunk_leak(text: str) -> str:
+    """Best-effort sanitiser for per-chunk strings the LLM produced.
+
+    Strategy: strip the leading sentence(s) that contain a leak phrase.
+    Sentences are split heuristically on '. ', '! ', '? '. If after
+    stripping the result is empty (everything was a leak), return "".
+    Used by `_parse()` so the reduce-step input is already cleaner, AND
+    by the deterministic merge fallback so a failed reduce doesn't
+    publish chunk-y prose.
+    """
+    if not text:
+        return text
+    # Cheap path: if no leak in the whole string, nothing to do.
+    if not _has_chunk_leak(text):
+        return text
+    # Sentence-ish split. We deliberately keep the splitter cheap; the
+    # rare false positives (URLs with periods, abbreviations) are not
+    # worth a real NLP dependency for a defensive scrub.
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    kept = [p for p in parts if not _has_chunk_leak(p)]
+    out = " ".join(kept).strip()
+    return out
+
+
 def merge_partials_deterministic(partials: list[LLMExtraction]) -> LLMExtraction:
     """Merge per-chunk partial extractions into a single extraction using
     deterministic rules. Narrative fields (title/description/summary) are
@@ -451,22 +538,44 @@ def merge_partials_deterministic(partials: list[LLMExtraction]) -> LLMExtraction
     document_date = _pick_date([p.document_date for p in partials], prefer_earliest=True)
     last_update_date = _pick_date([p.last_update_date for p in partials], prefer_earliest=False)
 
-    # Title: longest non-empty (proxy for "most informative")
-    titles = [p.title.strip() for p in partials if p.title and p.title.strip()]
+    # Title: longest non-empty NON-LEAKY title (proxy for "most
+    # informative"). Leaky titles ("Chunk 4 of 12 - SAP S/4HANA Service
+    # capabilities") would otherwise win on length and make us look bad.
+    titles = [
+        p.title.strip()
+        for p in partials
+        if p.title and p.title.strip() and not _has_chunk_leak(p.title)
+    ]
     title = max(titles, key=len) if titles else ""
 
-    # Description: first non-empty (will be replaced by reduce LLM if enabled)
-    descriptions = [p.description.strip() for p in partials if p.description and p.description.strip()]
-    description = descriptions[0] if descriptions else ""
+    # Description fallback (LLM reduce step usually overrides this; this
+    # path runs when reduce fails or is disabled): pick the longest
+    # non-empty NON-LEAKY description. Falls through to "" if every
+    # partial description leaked the chunking strategy — better empty
+    # than published with chunk-y prose.
+    descriptions = [
+        p.description.strip()
+        for p in partials
+        if p.description and p.description.strip()
+        and not _has_chunk_leak(p.description)
+    ]
+    description = max(descriptions, key=len) if descriptions else ""
 
-    # Summary fallback: concatenate top partial summaries up to 2500 chars
-    summaries = [p.summary.strip() for p in partials if p.summary and p.summary.strip()]
-    summary = ""
-    for s in summaries:
-        if len(summary) + len(s) + 2 > 2500:
-            break
-        summary = (summary + "\n\n" + s).strip() if summary else s
-    summary = summary[:2500]
+    # Summary fallback: previously concatenated per-chunk summaries
+    # verbatim, which leaked phrases like "This chunk contains slides
+    # 247-259..." straight into the user-visible summary on every
+    # reduce-failure. New behaviour: pick the SINGLE BEST non-leaky
+    # partial summary (longest wins as a proxy for "most informative")
+    # and truncate to 2500 chars. If every partial's summary is leaky,
+    # return "" — that's safer than publishing chunk-y prose, and the
+    # next re-evaluation can fix it.
+    candidates = [
+        p.summary.strip()
+        for p in partials
+        if p.summary and p.summary.strip()
+        and not _has_chunk_leak(p.summary)
+    ]
+    summary = max(candidates, key=len)[:2500] if candidates else ""
 
     return LLMExtraction(
         title=title,
@@ -829,6 +938,36 @@ class LMClient:
         # Legacy quality_score field == min (so existing UI/Excel work).
         merged.quality_score = merged.quality_score_min
 
+        # Chunk-yield warning: if a meaningful fraction of the chunks
+        # produced an empty partial (quality_score==0 and all narrative
+        # fields blank), the run was clearly degraded — usually because
+        # the LLM hit empty-response cycles. Surface it so the user
+        # doesn't think the file is high-quality just because reduce
+        # synthesised some narrative. The deterministic minimum of 0.0
+        # also propagates to merged.quality_score, but a textual
+        # warning is much more actionable than a number.
+        n_yielded = sum(
+            1 for p in partials
+            if p.quality_score > 0
+            or any([p.title, p.description, p.summary])
+            or p.named_entities.persons
+            or p.named_entities.organizations
+            or p.named_entities.products_technologies
+        )
+        if total > 0:
+            yield_pct = n_yielded / total
+        else:
+            yield_pct = 1.0
+        if yield_pct < 0.5 and total >= 2:
+            merged.extraction_warning = (
+                f"low_chunk_yield: {int(yield_pct * 100)}% of {total} "
+                f"chunks produced output ({n_yielded}/{total})"
+            )
+            log.warning(
+                "Low chunk yield for %s: %d/%d chunks produced output (%d%%)",
+                relative_path, n_yielded, total, int(yield_pct * 100),
+            )
+
         # Optional final reduce LLM call to consolidate narrative fields.
         if self.mapreduce_cfg.reduce_with_llm and partials:
             if self._cancelled:
@@ -914,6 +1053,46 @@ class LMClient:
             return self._parse(raw)
         except LLMCancelled:
             raise
+        except LLMEmptyResponseError as e:
+            # Empty-response is the dominant failure mode on long runs:
+            # the model ate the entire token budget on hidden reasoning
+            # and emitted nothing. Two-step recovery:
+            #   1. retry with 1.5x the budget, capped at the global
+            #      max_output_tokens, and a stronger anti-thinking
+            #      directive prepended to the user message;
+            #   2. if that ALSO comes back empty, give up on this chunk
+            #      and return an empty partial — the file overall still
+            #      makes progress and the chunk_yield warning will be
+            #      raised.
+            bigger = min(
+                int(max_tokens * 1.5),
+                int(self.cfg.max_output_tokens),
+            )
+            log.warning(
+                "Chunk %d/%d empty response for %s "
+                "(model=%r, max_tokens=%d -> %d); "
+                "retrying with bigger budget.",
+                chunk_index, total_chunks, relative_path,
+                e.model, max_tokens, bigger,
+            )
+            stronger = (
+                "Respond with the JSON object DIRECTLY. Do not produce "
+                "reasoning, do not produce <think> blocks, do not preface "
+                "or postface. JSON only.\n\n" + user_prompt
+            )
+            try:
+                raw2 = self._chat(CHUNK_SYSTEM_PROMPT, stronger,
+                                  use_thinking=False, max_tokens=bigger)
+                return self._parse(raw2)
+            except LLMCancelled:
+                raise
+            except Exception as e2:
+                log.warning(
+                    "Chunk %d/%d empty-response retry failed for %s: %s; "
+                    "using empty partial.",
+                    chunk_index, total_chunks, relative_path, e2,
+                )
+                return LLMExtraction()
         except (LLMInvalidJSONError, LLMSchemaError) as e:
             # On a parse/schema failure for ONE chunk, retry once with a
             # corrective instruction. If it fails again, fall back to an
@@ -1126,9 +1305,28 @@ class LMClient:
 
         data = r.json()
         try:
-            return data["choices"][0]["message"]["content"] or ""
+            content = data["choices"][0]["message"]["content"] or ""
         except Exception as e:
             raise LLMError(f"unexpected LM Studio response shape: {e}; body={data!r}")
+
+        # Detect "HTTP 200 with empty content" — distinct from the
+        # also-pathological "valid JSON but bad schema" or "no JSON
+        # object" cases. Both an entirely empty `content` and a
+        # `content` that contains ONLY <think>...</think> fall in this
+        # bucket: the model's reasoning ate the whole token budget.
+        # Surface as LLMEmptyResponseError so callers can retry with a
+        # larger `max_tokens` and a stronger anti-thinking directive
+        # rather than burning the same retry path that's meant for
+        # malformed JSON.
+        if not content or not content.strip():
+            raise LLMEmptyResponseError(model=model_to_use, raw_snippet=content[:200])
+        post_think = self._strip_thinking(content)
+        if not post_think.strip():
+            raise LLMEmptyResponseError(
+                model=model_to_use,
+                raw_snippet=content[:200],
+            )
+        return content
 
     # ---------- parsing ----------
 
@@ -1220,6 +1418,17 @@ class LMClient:
         for k in str_fields:
             v = data.get(k)
             data[k] = "" if v is None else str(v).strip()
+
+        # Server-side scrub of "this chunk contains slides 247-259..."-style
+        # leaks in the prose fields. We do this even for the single-shot
+        # path (where it should be impossible) because the marginal cost
+        # is a few regex hits and it makes the contract uniform: NO row
+        # in the registry should ever contain a chunk-y phrase. The
+        # reduce-step input is also cleaner because of this.
+        for k in ("title", "description", "summary"):
+            v = data.get(k, "")
+            if v:
+                data[k] = _scrub_chunk_leak(v)
 
         # Drop any extra keys that are not part of LLMExtraction so the
         # constructor does not error on stray fields the model might have

@@ -24,14 +24,17 @@ llm:
   thinking_on_low_quality: true # Re-run with thinking ON if quality_score < threshold.
   low_quality_threshold: 0.6
   # Output token cap (per LLM call). Must be large enough for reasoning + JSON.
-  # 4096 works well with 8192 context length in LM Studio.
-  max_output_tokens: 4096
+  # 6144 leaves comfortable headroom inside an 8192-token context window
+  # (was 4096; the smaller cap was getting eaten entirely by hidden
+  # reasoning tokens on dense chunks, producing `(empty response)`).
+  max_output_tokens: 6144
   # Total wall-clock time budget (seconds) for ALL LLM activity on a single
   # file (chunk calls + reduce, including retries). Different from
   # `request_timeout_seconds` (which is per HTTP request). When exceeded, the
-  # file is marked 'error' with 'llm_total_timeout'. Default ~16.7 hours
-  # acts as a safety net rather than an active limit.
-  per_file_timeout_seconds: 60000
+  # file is marked 'error' with 'llm_total_timeout'. Default 3600 (1 hour)
+  # caps how long a single stuck file can hold up the queue. Bump it for
+  # repositories that legitimately need more time per file.
+  per_file_timeout_seconds: 3600
   # Multi-modal (vision) settings for image files. When enabled=true,
   # image documents (.png, .jpg, .heic, ...) are sent to the LLM as a
   # base64-encoded image plus a small text hint (filename / EXIF). Set
@@ -88,8 +91,11 @@ extract:
     # Documents with extracted text longer than this go through chunked
     # extraction so every page/section is actually processed by the LLM.
     threshold_chars: 10000
-    # Target chunk size in characters.
-    chunk_chars: 10000
+    # Target chunk size in characters. 6 000 finishes more reliably
+    # than 10 000 — at the larger size dense product-feature listings
+    # blew past the per-chunk token budget and produced
+    # `(empty response)` storms.
+    chunk_chars: 6000
     # Overlap between consecutive chunks to avoid losing context across
     # page boundaries.
     chunk_overlap_chars: 500
@@ -100,9 +106,10 @@ extract:
     # description, summary, etc.). If false, narrative fields are merged
     # deterministically (zero hallucination risk, less coherent output).
     reduce_with_llm: true
-    # Smaller token cap for chunk extractions (faster, less likely to
-    # truncate).
-    per_chunk_max_output_tokens: 1500
+    # Output token cap for chunk extractions. 2048 leaves headroom
+    # under the global llm.max_output_tokens=6144 cap and is enough for
+    # the slightly richer entity lists the leak-aware prompt produces.
+    per_chunk_max_output_tokens: 2048
 
 # Which extensions to consider documents.
 include_extensions:

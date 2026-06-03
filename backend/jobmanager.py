@@ -1515,6 +1515,18 @@ class JobManager:
             )
             self._end_step("llm_extract", percent=90, detail=verbose)
 
+            # Surface non-fatal extraction warnings (e.g. low_chunk_yield
+            # set by the map-reduce path when too many chunks came back
+            # empty). The file still goes to status='done' — the worker
+            # made progress — but the user gets a visible breadcrumb in
+            # the activity log explaining the misleadingly high
+            # quality_score that map-reduce sometimes produces.
+            extraction_warning = getattr(extraction, "extraction_warning", "") or ""
+            if extraction_warning:
+                self._set_message(
+                    f"  [llm_extract] WARNING: {extraction_warning}"
+                )
+
             self._begin_step("save", percent=95, detail="Saving to local DB...")
             default_repo = self._state.repository or ""
             self.db.save_extraction(
@@ -1526,10 +1538,28 @@ class JobManager:
             )
             self._end_step("save", percent=100, detail="Saved")
 
+            # If we have a non-fatal warning, persist it on the file row's
+            # `error` column with a "WARN: " prefix so it shows up in the
+            # grid and Excel (option (ii) from the handoff: cheaper than
+            # adding a new column, with the marker convention making it
+            # trivial to distinguish from a real error).
+            if extraction_warning:
+                try:
+                    self.db.update_fields(
+                        rec.relative_path,
+                        {"error": f"WARN: {extraction_warning}"[:4000]},
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to persist extraction_warning for %s",
+                        rec.relative_path,
+                    )
+
             self._set_message(
                 f"Done: {rec.relative_path} "
                 f"(q={extraction.quality_score:.2f}, "
                 f"thinking={'on' if used_thinking else 'off'})"
+                + (f" [warn: {extraction_warning}]" if extraction_warning else "")
             )
             self._end_file()
             return True
