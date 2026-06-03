@@ -184,6 +184,34 @@ docregistrar/
 
 ---
 
+## Vision support (image documents)
+
+When the configured LLM is **multi-modal** (i.e. accepts an image as a content part), image files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.tif`, `.tiff`, `.webp`, `.heic`) are sent to the model as **base64-encoded image content** alongside a small text hint (file name, folder, EXIF). This lets the model fill `description` / `summary` / `document_type` from what it actually sees in the image, instead of guessing from the file name only.
+
+Behaviour and configuration (`config.yaml` → `llm.vision`):
+
+```yaml
+llm:
+  vision:
+    enabled: true                  # master switch; false = legacy text-only behaviour
+    model: ""                      # optional: separate vision model. "" = reuse llm.model
+    max_image_dim: 1568            # longest side; larger images are downscaled
+    max_bytes: 4194304             # cap on encoded payload (~4 MiB)
+    jpeg_quality: 85
+    include_text_hints: true       # also send filename/folder/EXIF
+    detail: auto                   # OpenAI vision detail hint: auto | low | high
+    fallback_to_text_on_error: true # if vision call 4xx's, retry once text-only
+```
+
+Notes:
+
+- The image payload pipeline (downscale → JPEG/PNG re-encode → optional dimension clamp) and EXIF harvesting all log line-by-line at INFO so you can see exactly what was sent. Failures (corrupt files, oversized payloads, missing HEIC support) log at WARNING.
+- `pillow-heif` is listed in `requirements.txt`. If the wheel can't install on your machine, HEIC files just fall back to text-only metadata.
+- Disable vision (`enabled: false`) if your loaded model is text-only; image files will then be processed exactly as in older versions.
+- For an LM Studio setup where you keep both a fast text model and a vision model loaded at once, set `llm.model` to the text model and `llm.vision.model` to the vision model.
+
+---
+
 ## Privacy
 
 All extraction happens on your machine. The only network calls the agent makes are to `http://localhost:1234` (your LM Studio server). No telemetry, no cloud calls, no third-party APIs.

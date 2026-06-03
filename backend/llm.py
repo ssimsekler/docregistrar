@@ -11,11 +11,12 @@ Supports two extraction strategies:
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
 from collections import Counter
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import httpx
 from tenacity import (
@@ -26,6 +27,7 @@ from tenacity import (
 )
 
 from .config import LLMConfig, MapReduceConfig
+from .extractors import ExtractedImage
 from .schemas import LLMExtraction, NamedEntities
 
 log = logging.getLogger("docregistrar.llm")
@@ -536,11 +538,18 @@ class LMClient:
         relative_path: str,
         use_thinking: Optional[bool] = None,
         progress_cb: ChunkProgressCB = None,
+        image: Optional[ExtractedImage] = None,
     ) -> tuple[LLMExtraction, bool]:
         """Run extraction. Returns (extraction, used_thinking).
 
-        Routes to either the single-shot fast path (small docs) or the
-        map-reduce path (large docs), based on cfg.mapreduce.
+        Routes to either the single-shot fast path (small docs / images)
+        or the map-reduce path (large docs), based on cfg.mapreduce.
+
+        When `image` is provided AND `cfg.vision.enabled` is True, the
+        image is attached as a multi-modal content part on the
+        single-shot user message; map-reduce is bypassed (the text hint
+        is always tiny and shouldn't trigger chunking, but we force the
+        single-shot path defensively).
 
         `progress_cb(unit, current, total)` is invoked for chunk-level
         progress; only called for the map-reduce path. May raise to
@@ -550,7 +559,28 @@ class LMClient:
         mr = self.mapreduce_cfg
         text = text or ""
 
-        use_mapreduce = bool(mr.enabled) and len(text) > int(mr.threshold_chars)
+        # When an image is attached we always run single-shot; map-reduce
+        # over text hints would just split filename/EXIF lines pointlessly
+        # and lose the image attachment on the chunk calls.
+        has_image = image is not None and bool(self.cfg.vision.enabled)
+        use_mapreduce = (
+            bool(mr.enabled)
+            and len(text) > int(mr.threshold_chars)
+            and not has_image
+        )
+
+        if has_image:
+            log.info(
+                "LLM vision call: file=%s mime=%s dims=%dx%d bytes=%d "
+                "vision_model=%r text_model=%r include_text_hints=%s "
+                "detail=%s",
+                relative_path,
+                image.mime, image.width, image.height, len(image.data),
+                self.cfg.vision.model or "(reuse llm.model)",
+                self.cfg.model,
+                self.cfg.vision.include_text_hints,
+                self.cfg.vision.detail,
+            )
 
         if not use_mapreduce:
             result = self._extract_single_shot(
@@ -558,6 +588,7 @@ class LMClient:
                 file_name=file_name,
                 relative_path=relative_path,
                 use_thinking=thinking,
+                image=image if has_image else None,
             )
             # Mirror legacy quality_score into min/avg
             result.quality_score_min = result.quality_score
@@ -580,6 +611,7 @@ class LMClient:
                         file_name=file_name,
                         relative_path=relative_path,
                         use_thinking=True,
+                        image=image if has_image else None,
                     )
                     result.quality_score_min = result.quality_score
                     result.quality_score_avg = result.quality_score
@@ -631,32 +663,114 @@ class LMClient:
         file_name: str,
         relative_path: str,
         use_thinking: bool,
+        image: Optional[ExtractedImage] = None,
     ) -> LLMExtraction:
-        user_prompt = (
-            f"File name: {file_name}\n"
-            f"Relative path: {relative_path}\n"
-            f"--- BEGIN DOCUMENT TEXT ---\n"
-            f"{text or '[empty document]'}\n"
-            f"--- END DOCUMENT TEXT ---\n"
-            f"Now produce the JSON object. JSON only."
-        )
+        # If we have an image AND vision is enabled, attach it to the
+        # user message as a multi-modal content part. The text body is
+        # the (small) hint blob built by the image extractor; the model
+        # sees both.
+        vision_active = image is not None and bool(self.cfg.vision.enabled)
+
+        if vision_active and self.cfg.vision.include_text_hints:
+            text_block = (
+                f"File name: {file_name}\n"
+                f"Relative path: {relative_path}\n"
+                f"--- BEGIN IMAGE METADATA ---\n"
+                f"{text or '[no metadata]'}\n"
+                f"--- END IMAGE METADATA ---\n"
+                f"An image is attached. Look at it directly. Use the file "
+                f"name and EXIF metadata only as supporting hints. Set "
+                f"\"document_type\" to a specific image category when "
+                f"possible (e.g. \"photograph\", \"screenshot\", "
+                f"\"diagram\", \"scan\", \"chart\"). Fill \"description\" "
+                f"and \"summary\" based on what you actually see in the "
+                f"image.\n"
+                f"Now produce the JSON object. JSON only."
+            )
+        elif vision_active:
+            # No text hints requested.
+            text_block = (
+                f"File name: {file_name}\n"
+                f"Relative path: {relative_path}\n"
+                f"An image is attached. Look at it directly. Set "
+                f"\"document_type\" to a specific image category when "
+                f"possible (e.g. \"photograph\", \"screenshot\", "
+                f"\"diagram\", \"scan\", \"chart\").\n"
+                f"Now produce the JSON object. JSON only."
+            )
+        else:
+            # Legacy text-only behaviour.
+            text_block = (
+                f"File name: {file_name}\n"
+                f"Relative path: {relative_path}\n"
+                f"--- BEGIN DOCUMENT TEXT ---\n"
+                f"{text or '[empty document]'}\n"
+                f"--- END DOCUMENT TEXT ---\n"
+                f"Now produce the JSON object. JSON only."
+            )
+
+        # Build the (text, image) pair we'll hand to _chat. _chat decides
+        # whether to send a string or a multi-modal list based on the
+        # image argument.
+        attached = image if vision_active else None
 
         # First attempt
-        raw = self._chat(SYSTEM_PROMPT, user_prompt, use_thinking=use_thinking,
-                         max_tokens=self.cfg.max_output_tokens)
+        try:
+            raw = self._chat(
+                SYSTEM_PROMPT, text_block,
+                use_thinking=use_thinking,
+                max_tokens=self.cfg.max_output_tokens,
+                image=attached,
+            )
+        except LLMHTTPError as e:
+            # Vision-specific safety net: if the configured (vision) model
+            # rejects the multi-modal request with a 4xx, fall back once
+            # to a text-only call so the file at least gets some metadata.
+            # 5xx is left to the normal retry path.
+            if (
+                attached is not None
+                and 400 <= e.status_code < 500
+                and self.cfg.vision.fallback_to_text_on_error
+            ):
+                log.warning(
+                    "Vision call failed with HTTP %d for %s "
+                    "(model=%r, body=%s); retrying text-only.",
+                    e.status_code, relative_path,
+                    self.cfg.vision.model or self.cfg.model,
+                    e.body_snippet[:200],
+                )
+                # Drop the image, keep the text hints.
+                raw = self._chat(
+                    SYSTEM_PROMPT, text_block,
+                    use_thinking=use_thinking,
+                    max_tokens=self.cfg.max_output_tokens,
+                    image=None,
+                )
+                log.info(
+                    "Vision fallback: text-only call succeeded for %s.",
+                    relative_path,
+                )
+            else:
+                raise
         try:
             return self._parse(raw)
         except LLMError as e:
             log.warning("First-pass JSON parse failed for %s: %s", relative_path, e)
 
-        # Retry once with explicit corrective instruction
+        # Retry once with explicit corrective instruction. Re-attach the
+        # image if we had one (and vision is still enabled); the parse
+        # failure was about the JSON shape, not the image.
         retry_msg = (
             "Your previous response was not valid JSON or did not match the schema. "
             "Return ONE JSON object only, no prose, no Markdown fences. "
-            f"\n\nORIGINAL TASK:\n{user_prompt}"
+            f"\n\nORIGINAL TASK:\n{text_block}"
         )
-        raw2 = self._chat(SYSTEM_PROMPT, retry_msg, use_thinking=use_thinking,
-                          max_tokens=self.cfg.max_output_tokens)
+        raw2 = self._chat(
+            SYSTEM_PROMPT, retry_msg,
+            use_thinking=use_thinking,
+            max_tokens=self.cfg.max_output_tokens,
+            image=attached,
+        )
         return self._parse(raw2)
 
     # ---------- internal: map-reduce ----------
@@ -916,7 +1030,8 @@ class LMClient:
         stop=stop_after_attempt(3),
     )
     def _chat(self, system_prompt: str, user_msg: str, *,
-              use_thinking: bool, max_tokens: int) -> str:
+              use_thinking: bool, max_tokens: int,
+              image: Optional[ExtractedImage] = None) -> str:
         # Qwen3.5 supports a thinking mode. LM Studio's OpenAI-compatible
         # server accepts plain prompt directives like "/think" or "/no_think".
         # Belt-and-braces: put the directive in BOTH the system message AND
@@ -928,11 +1043,53 @@ class LMClient:
         directive = "/think" if use_thinking else "/no_think"
         user_msg_with_directive = f"{user_msg}\n{directive}"
 
+        # If an image is attached, build OpenAI-style multi-modal user
+        # content (a list of typed parts). Otherwise the user content is
+        # a plain string (legacy behaviour, identical to before).
+        user_content: Union[str, list[dict[str, Any]]]
+        model_to_use = self.cfg.model
+        if image is not None:
+            try:
+                b64 = base64.b64encode(image.data).decode("ascii")
+            except Exception as e:
+                # Defense in depth: if base64 somehow fails, fall back to
+                # text-only and log loudly.
+                log.error(
+                    "base64-encode of image failed (%s: %s); "
+                    "falling back to text-only.",
+                    type(e).__name__, e,
+                )
+                user_content = user_msg_with_directive
+            else:
+                data_url = f"data:{image.mime};base64,{b64}"
+                detail = (self.cfg.vision.detail or "auto").lower()
+                if detail not in ("auto", "low", "high"):
+                    detail = "auto"
+                user_content = [
+                    {"type": "text", "text": user_msg_with_directive},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": data_url, "detail": detail},
+                    },
+                ]
+                # Use the dedicated vision model when configured, else
+                # reuse the default text model.
+                if self.cfg.vision.model:
+                    model_to_use = self.cfg.vision.model
+                log.debug(
+                    "Vision payload: model=%r prompt_chars=%d "
+                    "image_b64_chars=%d mime=%s detail=%s",
+                    model_to_use, len(user_msg_with_directive),
+                    len(b64), image.mime, detail,
+                )
+        else:
+            user_content = user_msg_with_directive
+
         body: dict[str, Any] = {
-            "model": self.cfg.model,
+            "model": model_to_use,
             "messages": [
                 {"role": "system", "content": f"{system_prompt}\n{directive}"},
-                {"role": "user", "content": user_msg_with_directive},
+                {"role": "user", "content": user_content},
             ],
             "temperature": float(self.cfg.temperature),
             "top_p": float(self.cfg.top_p),
@@ -956,14 +1113,15 @@ class LMClient:
                 body_str = r.text or ""
             snippet = (body_str or "")[:500]
             log.error(
-                "LM Studio %s on %s. Request model=%r. Response: %r",
-                r.status_code, r.request.url, self.cfg.model, body_str,
+                "LM Studio %s on %s. Request model=%r (vision=%s). Response: %r",
+                r.status_code, r.request.url, model_to_use,
+                "yes" if image is not None else "no", body_str,
             )
             raise LLMHTTPError(
                 status_code=r.status_code,
                 body_snippet=snippet,
                 base_url=self.cfg.base_url,
-                model=self.cfg.model,
+                model=model_to_use,
             )
 
         data = r.json()

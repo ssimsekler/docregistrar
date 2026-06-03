@@ -3,6 +3,9 @@
 Each extractor returns an ExtractionResult with:
   - text: concatenated plain text (caller will apply head/middle/tail truncation)
   - page_count: int or None
+  - image: optional ExtractedImage payload (set only by the image extractor
+    when vision support is desired; the LLM client decides whether/how to
+    use it)
 
 Extractors that loop over pages/slides/sheets accept an optional
 `progress_cb(current, total, unit)` callback to surface live progress
@@ -11,7 +14,7 @@ to the caller (e.g. JobManager). The callback may raise
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,18 +31,54 @@ class UserSkippedError(Exception):
 
 
 @dataclass
+class ExtractedImage:
+    """An image payload ready to be sent to a vision-capable LLM.
+
+    `data` is the raw bytes of the (possibly downscaled, re-encoded) image.
+    `mime` is the MIME type matching `data` (typically "image/jpeg" or
+    "image/png"). `width` and `height` are the dimensions of the encoded
+    payload (i.e. AFTER any downscaling), in pixels.
+    """
+    data: bytes
+    mime: str
+    width: int
+    height: int
+
+    def __repr__(self) -> str:  # avoid dumping raw bytes in logs
+        return (
+            f"ExtractedImage(mime={self.mime!r}, "
+            f"size={self.width}x{self.height}, bytes={len(self.data)})"
+        )
+
+
+@dataclass
 class ExtractionResult:
     text: str = ""
     page_count: Optional[int] = None
     extraction_error: str = ""
+    image: Optional[ExtractedImage] = None
 
 
 def extract_any(path: Path, ext: str,
-                progress_cb: ProgressCB = None) -> ExtractionResult:
+                progress_cb: ProgressCB = None,
+                *,
+                image_options: Optional[dict] = None) -> ExtractionResult:
     """Dispatch to the right extractor by file extension (lowercase, with dot).
 
     Re-raises UserSkippedError so the caller can distinguish a user-initiated
     skip from a genuine extraction error.
+
+    `image_options` (optional) is a dict of keyword arguments forwarded to
+    `extract_image` for image extensions, e.g.::
+
+        {
+            "build_image_payload": True,
+            "max_image_dim": 1568,
+            "max_bytes": 4194304,
+            "jpeg_quality": 85,
+        }
+
+    Non-image extractors ignore it.
     """
     ext = ext.lower()
     try:
@@ -66,9 +105,11 @@ def extract_any(path: Path, ext: str,
                 except Exception:
                     pass
             return res
-        if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}:
+        if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",
+                   ".webp", ".heic"}:
             from .image import extract_image
-            res = extract_image(path)
+            kwargs = dict(image_options or {})
+            res = extract_image(path, **kwargs)
             if progress_cb is not None:
                 try:
                     progress_cb(1, 1, "image")

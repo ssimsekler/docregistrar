@@ -806,12 +806,25 @@ class JobManager:
             # thread and abort if it exceeds the configured budget. This
             # protects the worker from corrupt files that hang forever.
             per_file_timeout = float(cfg.extract.per_file_timeout_seconds or 0)
+
+            # For image files, pass the vision config to the image
+            # extractor so it can produce a properly sized payload.
+            # Non-image extractors ignore image_options.
+            vcfg = cfg.llm.vision
+            image_options = {
+                "build_image_payload": bool(vcfg.enabled),
+                "max_image_dim": int(vcfg.max_image_dim),
+                "max_bytes": int(vcfg.max_bytes),
+                "jpeg_quality": int(vcfg.jpeg_quality),
+            }
+
             try:
                 if per_file_timeout > 0:
                     with ThreadPoolExecutor(max_workers=1) as _ex:
                         _fut = _ex.submit(
                             extract_any, path, rec.extension,
                             progress_cb=_on_extract_progress,
+                            image_options=image_options,
                         )
                         try:
                             res = _fut.result(timeout=per_file_timeout)
@@ -840,7 +853,8 @@ class JobManager:
                             return False
                 else:
                     res = extract_any(path, rec.extension,
-                                      progress_cb=_on_extract_progress)
+                                      progress_cb=_on_extract_progress,
+                                      image_options=image_options)
             except UserSkippedError:
                 self._end_step("extract_text", percent=10, detail="skipped by user (mid-extraction)")
                 self.db.mark_status(
@@ -941,6 +955,50 @@ class JobManager:
                 cfg.llm.thinking_default if override is None else override
             )
             thinking_label = "on" if effective_thinking else "off"
+
+            # Vision plumbing: if the extractor produced an image payload
+            # AND vision is enabled, the LLM call will include the image.
+            # Note the strategy_detail reflects this so the activity log
+            # shows "with image attached" up front.
+            attaching_image = (
+                res.image is not None
+                and bool(cfg.llm.vision.enabled)
+            )
+            if attaching_image:
+                vision_model_name = (
+                    cfg.llm.vision.model or cfg.llm.model
+                )
+                strategy_detail = (
+                    f"single-shot vision, image={res.image.width}x"
+                    f"{res.image.height} ({len(res.image.data):,} bytes, "
+                    f"{res.image.mime}), vision_model={vision_model_name!r}"
+                )
+                log.info(
+                    "Image LLM extraction: %s (vision_model=%r, image=%s, "
+                    "%dx%d, %d bytes, mime=%s)",
+                    rec.relative_path, vision_model_name,
+                    "attached", res.image.width, res.image.height,
+                    len(res.image.data), res.image.mime,
+                )
+            elif rec.extension in (".png", ".jpg", ".jpeg", ".gif",
+                                   ".bmp", ".tif", ".tiff", ".webp", ".heic"):
+                # Image file but no payload available (e.g. extractor
+                # failed to decode, or vision disabled). Make this very
+                # visible in the log so it's not mysterious why the
+                # quality is low for that file.
+                if not cfg.llm.vision.enabled:
+                    log.info(
+                        "Image LLM extraction: %s (vision disabled in "
+                        "config; sending text hints only)",
+                        rec.relative_path,
+                    )
+                else:
+                    log.warning(
+                        "Image LLM extraction: %s (no image payload "
+                        "available; falling back to text hints only)",
+                        rec.relative_path,
+                    )
+
             self._begin_step(
                 "llm_extract",
                 percent=35,
@@ -1350,6 +1408,7 @@ class JobManager:
                         relative_path=rec.relative_path,
                         use_thinking=override,
                         progress_cb=_on_llm_progress,
+                        image=res.image if attaching_image else None,
                     )
                 except LLMCancelled:
                     if heartbeat_state["deadline_hit"]:

@@ -19,3 +19,7 @@ python-docx>=1.1
 python-pptx>=1.0
 openpyxl>=3.1
 pillow>=10
+# Optional: HEIC/HEIF support for iPhone images. Loaded via a soft import
+# in backend/extractors/image.py; if it isn't installed, HEIC files just
+# fall back to text-only metadata (file name + folder).
+pillow-heif>=0.18

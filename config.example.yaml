@@ -32,6 +32,34 @@ llm:
   # file is marked 'error' with 'llm_total_timeout'. Default ~16.7 hours
   # acts as a safety net rather than an active limit.
   per_file_timeout_seconds: 60000
+  # Multi-modal (vision) settings for image files. When enabled=true,
+  # image documents (.png, .jpg, .heic, ...) are sent to the LLM as a
+  # base64-encoded image plus a small text hint (filename / EXIF). Set
+  # enabled=false to keep the legacy text-only behaviour for images.
+  vision:
+    enabled: true
+    # Optional override of the model name JUST for image documents.
+    # Empty = reuse `llm.model`. Useful if you keep a fast text model
+    # loaded for documents and a separate vision model for images.
+    model: ""
+    # Longest side, in pixels. Larger images are downscaled before
+    # encoding so the payload stays bounded.
+    max_image_dim: 1568
+    # Cap on the encoded payload (bytes ~ 4 MiB). The encoder walks
+    # down a quality ladder (JPEG only) and, if still over, halves
+    # dimensions until it fits.
+    max_bytes: 4194304
+    jpeg_quality: 85
+    # Send filename / folder / EXIF as a text hint alongside the image.
+    # Strongly recommended: EXIF DateTimeOriginal carries info the
+    # model can't see in pixels.
+    include_text_hints: true
+    # OpenAI vision "detail" hint: auto | low | high. Servers that
+    # don't honor it ignore it harmlessly.
+    detail: auto
+    # If true and the vision call fails with HTTP 4xx (e.g. configured
+    # model doesn't actually accept images), retry once text-only.
+    fallback_to_text_on_error: true
 
 # Text-extraction limits sent to the LLM (characters, not tokens).
 # For SMALL documents the head + middle + tail of the document is concatenated

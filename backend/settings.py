@@ -47,6 +47,15 @@ EDITABLE_KEYS: set[str] = {
     "llm.low_quality_threshold",
     "llm.max_output_tokens",
     "llm.per_file_timeout_seconds",
+    # LLM vision (multi-modal image support)
+    "llm.vision.enabled",
+    "llm.vision.model",
+    "llm.vision.max_image_dim",
+    "llm.vision.max_bytes",
+    "llm.vision.jpeg_quality",
+    "llm.vision.include_text_hints",
+    "llm.vision.detail",
+    "llm.vision.fallback_to_text_on_error",
     # Processing
     "processing.max_error_retries",
     "processing.keep_awake_while_running",

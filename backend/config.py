@@ -8,6 +8,45 @@ import yaml
 from pydantic import BaseModel, Field
 
 
+class VisionConfig(BaseModel):
+    """Settings for sending image files to a vision-capable LLM.
+
+    When `enabled` is true, image files (.png, .jpg, .heic, ...) are sent
+    to the LLM as a multi-modal message: a base64-encoded image plus a
+    short text hint (filename, folder, EXIF) when `include_text_hints`
+    is true. When `enabled` is false, only the text hint is sent (legacy
+    behaviour).
+    """
+    # Master switch.
+    enabled: bool = True
+    # Optional override of the LLM model name JUST for image documents.
+    # Empty string means "reuse llm.model". Useful when you run a fast
+    # text-only model for documents and a separate vision model for
+    # images (LM Studio can host both at once).
+    model: str = ""
+    # Longest side, in pixels. Larger images are downscaled before
+    # encoding to keep payload size bounded.
+    max_image_dim: int = 1568
+    # Cap on the encoded payload (bytes). If still over after the
+    # quality ladder, dimensions are clamped further.
+    max_bytes: int = 4 * 1024 * 1024
+    # Initial JPEG quality. Re-encode walks down to lower qualities if
+    # max_bytes is exceeded.
+    jpeg_quality: int = 85
+    # Whether to also include filename / folder / EXIF as a text hint
+    # alongside the image. Strongly recommended; EXIF DateTimeOriginal
+    # in particular carries information the model can't see in the
+    # pixels.
+    include_text_hints: bool = True
+    # OpenAI vision "detail" hint: "auto", "low", or "high". Servers
+    # that don't honor it ignore it harmlessly.
+    detail: str = "auto"
+    # If true and the vision call fails with an HTTP 4xx (e.g. the
+    # configured model doesn't actually accept images), retry once with
+    # text-only content so the file at least gets some metadata.
+    fallback_to_text_on_error: bool = True
+
+
 class LLMConfig(BaseModel):
     base_url: str = "http://localhost:1234/v1"
     api_key: str = "lm-studio"
@@ -29,6 +68,8 @@ class LLMConfig(BaseModel):
     # a safety net rather than an active limit; tighten it from the
     # Settings dialog if you want a hard cap per file.
     per_file_timeout_seconds: int = 60000
+    # Vision (multi-modal) settings for image files. See VisionConfig.
+    vision: VisionConfig = Field(default_factory=VisionConfig)
 
 
 class MapReduceConfig(BaseModel):
